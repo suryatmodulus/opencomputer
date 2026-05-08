@@ -2034,23 +2034,33 @@ func (s *Store) GetSecretStoreByName(ctx context.Context, orgID uuid.UUID, name 
 	return &ss, nil
 }
 
-// GetSandboxSecretStoreID returns the secret_stores.id bound to the given
-// sandbox, or (nil, nil) if the sandbox has no store attached. The caller's
-// org scope is enforced — sandbox IDs aren't globally unique, so a leaked
-// ID from another org won't return that org's data. Pulled into its own
-// query rather than expanding SandboxSession because most callers don't
-// need this column and we want to keep the existing struct minimal.
-func (s *Store) GetSandboxSecretStoreID(ctx context.Context, orgID uuid.UUID, sandboxID string) (*uuid.UUID, error) {
-	var storeID *uuid.UUID
-	err := s.pool.QueryRow(ctx,
-		`SELECT secret_store_id FROM sandbox_sessions
+// GetSandboxStoreRefs returns the secret stores attached to a sandbox:
+//
+//   - primaryID is sandbox_sessions.secret_store_id, the "winning" store on
+//     the row (last layer for env-collision resolution; nil if no store).
+//   - baseStoreName is config->>'baseSecretStore' (parent store from the
+//     fork chain), populated when a fork layered an additional store on top
+//     of an inherited one. Empty string when there's no parent.
+//
+// Both are needed to reconstruct the runtime egress allowlist accurately:
+// the secrets proxy enforces the union of egress hosts from EVERY layered
+// store, while sandbox_sessions.secret_store_id only records the last one.
+// Without including the base store, an /allowed-hosts response on a layered
+// fork would underrepresent what the proxy actually allows.
+//
+// Org-scoped: sandbox IDs aren't globally unique, so a leaked ID from
+// another org won't return that org's data.
+func (s *Store) GetSandboxStoreRefs(ctx context.Context, orgID uuid.UUID, sandboxID string) (primaryID *uuid.UUID, baseStoreName string, err error) {
+	err = s.pool.QueryRow(ctx,
+		`SELECT secret_store_id, COALESCE(config->>'baseSecretStore', '')
+		 FROM sandbox_sessions
 		 WHERE org_id = $1 AND sandbox_id = $2 ORDER BY started_at DESC LIMIT 1`,
 		orgID, sandboxID,
-	).Scan(&storeID)
+	).Scan(&primaryID, &baseStoreName)
 	if err != nil {
-		return nil, fmt.Errorf("get sandbox secret store id: %w", err)
+		return nil, "", fmt.Errorf("get sandbox store refs: %w", err)
 	}
-	return storeID, nil
+	return primaryID, baseStoreName, nil
 }
 
 // ListSecretStores returns all secret stores for an org.

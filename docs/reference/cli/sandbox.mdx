@@ -129,3 +129,21 @@ oc sandbox allowed-hosts sb-abc123 --json
   }
 }
 ```
+
+### Layered forks
+
+When a fork layers an additional `--secret-store` on top of an inherited one, `egressAllowlist` is the **union** of both stores' allowlists (matches what the runtime proxy enforces). The response includes both store names — `secretStore` is the primary (whose secrets shadow the base on env-name collisions), `baseSecretStore` is the inherited parent:
+
+```json
+{
+  "sandboxID": "sb-fork456",
+  "secretStore": "fork-override",
+  "baseSecretStore": "fork-parent",
+  "egressAllowlist": ["api.openai.com", "api.anthropic.com", "api.example.com"],
+  "perSecretAllowedHosts": {
+    "OPENAI_API_KEY": ["api.openai.com"]
+  }
+}
+```
+
+`baseSecretStore` is omitted in the single-store case (no layering).

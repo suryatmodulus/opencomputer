@@ -307,15 +307,19 @@ The returned `AllowedHostsInfo`:
 </ParamField>
 
 <ParamField body="secretStore" type="string">
-  Name of the secret store the sandbox is bound to. Empty when the sandbox was created without a `secretStore` option.
+  Name of the primary secret store the sandbox is bound to (the "winning" store on the row, whose secrets shadow the base store on env-name collisions). Empty when the sandbox was created without a `secretStore` option.
+</ParamField>
+
+<ParamField body="baseSecretStore" type="string">
+  Name of the inherited parent store, present only when a fork layered an additional `secretStore` on top of an inherited one. Empty for sandboxes created from scratch and for forks without an override.
 </ParamField>
 
 <ParamField body="egressAllowlist" type="string[]">
-  Cluster-wide hosts the sandbox can reach via the secrets proxy.
+  Hosts the sandbox can reach via the secrets proxy. For layered forks this is the **union** of every layered store's allowlist (base first, primary's additions appended, deduped) — matches what the runtime proxy actually enforces.
 </ParamField>
 
 <ParamField body="perSecretAllowedHosts" type="Record<string, string[]>">
-  Optional per-secret restrictions. When the sandbox uses a listed secret in a request, only the listed hosts are reachable for that request.
+  Optional per-secret restrictions. When the sandbox uses a listed secret in a request, only the listed hosts are reachable for that request. For layered forks, the primary store's secrets shadow the base on name collisions (matches runtime env-collision behavior).
 </ParamField>
 
 ---

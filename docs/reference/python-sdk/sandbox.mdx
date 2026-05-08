@@ -246,12 +246,15 @@ Sandboxes created without a `secret_store` option return an empty allowlist with
 {
     "sandboxID": "sb-...",
     "secretStore": "my-store",                   # omitted if no store
+    "baseSecretStore": "parent-store",           # omitted unless this is a layered fork
     "egressAllowlist": ["api.openai.com", ...],
     "perSecretAllowedHosts": {
         "OPENAI_API_KEY": ["api.openai.com"],
     },
 }
 ```
+
+For forks that layered an additional ``secret_store`` on top of an inherited one, ``egressAllowlist`` is the **union** of both stores' allowlists (matches what the runtime proxy enforces) and ``baseSecretStore`` is populated with the inherited parent's name. For sandboxes with a single store (or none), ``baseSecretStore`` is omitted.
 
 ```python
 info = await sandbox.get_allowed_hosts()
