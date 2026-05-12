@@ -159,6 +159,7 @@ if ! az vm show -g "$RG" -n "$DATA_VM" -o none 2>/dev/null; then
     --assign-identity "$DATA_IDENTITY_ID" \
     --custom-data "$CLOUD_INIT" \
     --os-disk-size-gb 64 \
+    --nsg oc-ci-nsg-data \
     -o none
 else
   echo "    $DATA_VM already exists (cloud-init not re-run; rebuild with down.sh + up.sh)"

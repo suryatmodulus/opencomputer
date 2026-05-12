@@ -40,7 +40,15 @@ else
     for nic_id in $nic_ids; do
       az network nic delete --ids "$nic_id" -o none 2>/dev/null || true
     done
-    [[ -n "$osdisk" ]] && az disk delete -g "$RG" -n "$osdisk" --yes -o none 2>/dev/null || true
+    # Disk deletion can race with VM deletion (Azure detach lag); retry.
+    if [[ -n "$osdisk" ]]; then
+      for _ in 1 2 3 4 5; do
+        if az disk delete -g "$RG" -n "$osdisk" --yes -o none 2>/dev/null; then
+          break
+        fi
+        sleep 5
+      done
+    fi
     az network public-ip delete -g "$RG" -n "$pip_name" -o none 2>/dev/null || true
   done
 fi

@@ -62,6 +62,9 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Pre-flight tests (no infra)
+        run: go test -count=1 ./ci/tests/migration/...
+
       - name: Install SSH key
         run: |
           mkdir -p ~/.ssh
