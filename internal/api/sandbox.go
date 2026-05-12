@@ -2269,6 +2269,22 @@ func (s *Server) createFromCheckpointCore(c echo.Context, userEnvs map[string]st
 		return nil, http.StatusUnauthorized, fmt.Errorf("org context required")
 	}
 
+	// Enforce per-org concurrency limit on the fork path, mirroring the gate
+	// in the direct-create path at the top of CreateSandbox (around line 50).
+	// Without this, callers using POST /api/sandboxes/from-checkpoint/<id>
+	// (i.e. `oc checkpoint spawn` and equivalent SDK calls) can fork unbounded
+	// sandboxes past their plan's max_concurrent_sandboxes — every other
+	// per-plan gate (free-tier credits, machine size, disk size) is also
+	// missing on this path, but concurrency is the load-bearing one because
+	// it directly drives runaway billing.
+	//
+	// Fail-open on DB errors to match the existing direct-create behavior.
+	if org, gerr := s.store.GetOrg(ctx, orgID); gerr == nil {
+		if count, cerr := s.store.CountActiveSandboxes(ctx, orgID); cerr == nil && count >= org.MaxConcurrentSandboxes {
+			return nil, http.StatusTooManyRequests, fmt.Errorf("concurrent sandbox limit reached")
+		}
+	}
+
 	checkpointID, err := uuid.Parse(checkpointIDStr)
 	if err != nil {
 		return nil, http.StatusBadRequest, fmt.Errorf("invalid checkpoint ID")
