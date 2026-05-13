@@ -1,8 +1,14 @@
 name: PR Integration Test
 
+# Runs in the PR's context (not pull_request_target), so fork PRs run WITHOUT
+# secrets — eliminating the standard pull_request_target exfiltration vector.
+# For PRs from branches in this repo (org-member flow), the workflow does have
+# secrets, so we additionally gate behind an explicit `osb-ci-approve` label
+# applied by a maintainer. A companion workflow (pr-strip-approval.yml) auto-
+# removes the label on each push, forcing a fresh per-SHA approval.
 on:
-  pull_request_target:
-    types: [opened, synchronize, reopened, labeled]
+  pull_request:
+    types: [labeled]
 
 concurrency:
   group: pr-${{ github.event.pull_request.number }}
@@ -15,37 +21,14 @@ permissions:
 
 jobs:
   gate:
+    # Only the osb-ci-approve label triggers CI; other labels do nothing.
+    if: github.event.label.name == 'osb-ci-approve'
     runs-on: ubuntu-latest
     outputs:
       approved: ${{ steps.check.outputs.approved }}
-      reason: ${{ steps.check.outputs.reason }}
     steps:
       - id: check
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          AUTHOR: ${{ github.event.pull_request.user.login }}
-          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
-        run: |
-          if echo "$LABELS" | grep -q '"osb-ci-approve"'; then
-            echo "approved=true" >> "$GITHUB_OUTPUT"
-            echo "reason=labeled (osb-ci-approve)" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if gh api "orgs/diggerhq/members/$AUTHOR" --silent 2>/dev/null; then
-            echo "approved=true" >> "$GITHUB_OUTPUT"
-            echo "reason=org-member" >> "$GITHUB_OUTPUT"
-          else
-            echo "approved=false" >> "$GITHUB_OUTPUT"
-            echo "reason=outside-contributor; maintainer must apply osb-ci-approve label to run CI" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Comment on skip
-        if: steps.check.outputs.approved != 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh pr comment ${{ github.event.pull_request.number }} -R ${{ github.repository }} \
-            --body "CI skipped: ${{ steps.check.outputs.reason }}"
+        run: echo "approved=true" >> "$GITHUB_OUTPUT"
 
   ci:
     needs: gate
