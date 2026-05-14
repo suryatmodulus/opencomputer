@@ -88,9 +88,14 @@ export default {
       return jsonResponse({ accepted: 0, deduped: 0 }, 202);
     }
 
-    // KV dedup. Each get is a separate edge round-trip but parallelizable.
+    // KV dedup — but skip it for cell_capacity events. Those are idempotent
+    // UPDATEs (writing the same values twice has no effect), and they're high
+    // volume (one per cell per ~30s), so deduping them just burns KV reads.
+    // Sandbox lifecycle events still get the dedup because they're sometimes
+    // not idempotent at the downstream consumer (e.g. DO /debit calls).
+    const needsDedup = envelopes.map((e) => e.type !== "cell_capacity");
     const seenChecks = await Promise.all(
-      envelopes.map((e) => env.SESSIONS_KV.get(`seen:${e.id}`)),
+      envelopes.map((e, i) => (needsDedup[i] ? env.SESSIONS_KV.get(`seen:${e.id}`) : Promise.resolve(null))),
     );
     const fresh: SandboxEventEnvelope[] = [];
     let deduped = 0;
@@ -177,11 +182,13 @@ export default {
       console.error("events-ingest: R2 archive failed (continuing)", err);
     }
 
-    // KV dedup markers (24h TTL) — fire and forget per event.
+    // KV dedup markers (24h TTL) — fire and forget per event. Skip cell_capacity
+    // events for the same reason we skipped them on the read path: idempotent,
+    // high volume, KV writes are quota-bound.
     await Promise.all(
-      fresh.map((e) =>
-        env.SESSIONS_KV.put(`seen:${e.id}`, "1", { expirationTtl: KV_DEDUP_TTL_SEC }),
-      ),
+      fresh
+        .filter((e) => e.type !== "cell_capacity")
+        .map((e) => env.SESSIONS_KV.put(`seen:${e.id}`, "1", { expirationTtl: KV_DEDUP_TTL_SEC })),
     );
 
     return jsonResponse({ accepted: fresh.length, deduped }, 202);
