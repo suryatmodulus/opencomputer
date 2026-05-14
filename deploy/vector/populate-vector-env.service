@@ -7,11 +7,20 @@
 # worker.env on workers, server.env on the control plane. EnvironmentFile
 # lines with a leading `-` are silently skipped if the file is absent, so
 # this unit works on both roles.
+#
+# Ordering note: on Azure workers, cloud-init's final stage writes
+# /etc/opensandbox/worker.env from a base64 payload baked by the control
+# plane (internal/compute/azure.go). Without `After=cloud-final.service`
+# the populator races cloud-init, reads an empty environ, exits 0 on
+# the "OPENSANDBOX_AZURE_KEY_VAULT_NAME not set" branch, and never
+# retries (Restart=on-failure doesn't fire on exit 0). Vector then can't
+# start because vector.env was never written. Ordering after cloud-final
+# guarantees worker.env exists by the time we read it.
 
 [Unit]
 Description=Populate /etc/opensandbox/vector.env from Key Vault
-After=network-online.target
-Wants=network-online.target
+After=network-online.target cloud-final.service
+Wants=network-online.target cloud-final.service
 Before=vector.service
 DefaultDependencies=no
 # Retry budget for the Restart= below. StartLimit* belongs in [Unit] per
