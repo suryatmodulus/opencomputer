@@ -17,6 +17,11 @@
 
 set -euo pipefail
 
+# The CF account that owns `opencomputer-dev` (same as api-edge/wrangler.toml).
+# wrangler can't pick between multiple accounts non-interactively, so pin it.
+: "${CLOUDFLARE_ACCOUNT_ID:=1241f114453e32d292197e3fb36210b2}"
+export CLOUDFLARE_ACCOUNT_ID
+
 D1_DB="opencomputer-dev"
 DEV2_CP_URL="${1:?usage: seed_dev_xcell.sh <DEV2_CP_URL> [DEV3_CP_URL]}"
 DEV3_CP_URL="${2:-http://DEV3-CP-NOT-PROVISIONED-YET:8080}"

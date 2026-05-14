@@ -125,8 +125,37 @@ export default {
         JSON.stringify(e.payload ?? {}),
       ),
     );
+
+    // cell_capacity events: UPSERT the cells row so the api-edge's pickCell()
+    // cascade sees fresh placement metrics. Each event's payload carries the
+    // CP's view at sample time; we just write it through. Idempotent — re-
+    // applying the same event writes the same values. capacity_updated_at
+    // gates freshness (edge ignores cells stale beyond ~120s).
+    const capUpdate = env.OPENCOMPUTER_DB.prepare(
+      `UPDATE cells SET healthy_workers = ?1, available_workers = ?2,
+                        running_sandboxes = ?3, capacity_updated_at = ?4
+         WHERE cell_id = ?5`,
+    );
+    const nowSec = Math.floor(Date.now() / 1000);
+    const capacityBatches = fresh
+      .filter((e) => e.type === "cell_capacity")
+      .map((e) => {
+        const p = (e.payload ?? {}) as {
+          healthy_workers?: number;
+          available_workers?: number;
+          running_sandboxes?: number;
+        };
+        return capUpdate.bind(
+          p.healthy_workers ?? 0,
+          p.available_workers ?? 0,
+          p.running_sandboxes ?? 0,
+          nowSec,
+          e.cell_id,
+        );
+      });
+
     try {
-      await env.OPENCOMPUTER_DB.batch(batches);
+      await env.OPENCOMPUTER_DB.batch([...batches, ...capacityBatches]);
     } catch (err) {
       // Database errors are retryable — return 5xx so the CP forwarder
       // leaves the batch in the PEL.

@@ -113,16 +113,122 @@ async function authenticate(req: Request, env: Env): Promise<Caller | null> {
 
 interface CellRow {
   cell_id: string;
+  cloud: string;
+  region: string;
   base_url: string;
   status: string;
+  available_workers: number;
+  capacity_updated_at: number | null;
 }
 
 async function lookupCell(env: Env, cellID: string): Promise<CellRow | null> {
   return env.OPENCOMPUTER_DB.prepare(
-    "SELECT cell_id, base_url, status FROM cells WHERE cell_id = ?1",
+    `SELECT cell_id, cloud, region, base_url, status, available_workers, capacity_updated_at
+       FROM cells WHERE cell_id = ?1`,
   )
     .bind(cellID)
     .first<CellRow>();
+}
+
+// Freshness window — the CP emits capacity events every ~30s; 120s is a
+// generous 4× margin that covers a missed sample without flapping.
+const CAPACITY_FRESH_SEC = 120;
+
+function isHealthy(cell: CellRow, nowSec: number): boolean {
+  if (cell.status !== "active") return false;
+  if (cell.capacity_updated_at == null) return false;
+  if (nowSec - cell.capacity_updated_at > CAPACITY_FRESH_SEC) return false;
+  if (cell.available_workers <= 0) return false;
+  return true;
+}
+
+// Continent buckets used by distanceRank when cells span clouds. Coarse on
+// purpose — we just need "near" vs "far" for the cascade. Unknown regions
+// fall through to tier 3 (global).
+const REGION_CONTINENT: Record<string, string> = {
+  // Azure NA
+  westus: "na", westus2: "na", westus3: "na",
+  eastus: "na", eastus2: "na", centralus: "na", northcentralus: "na", southcentralus: "na",
+  canadacentral: "na", canadaeast: "na",
+  // Azure EU
+  westeurope: "eu", northeurope: "eu", francecentral: "eu", germanywestcentral: "eu",
+  uksouth: "eu", ukwest: "eu",
+  // Azure APAC
+  japaneast: "ap", japanwest: "ap", koreacentral: "ap",
+  southeastasia: "ap", eastasia: "ap",
+  australiaeast: "ap", australiasoutheast: "ap",
+  // AWS NA
+  "us-east-1": "na", "us-east-2": "na", "us-west-1": "na", "us-west-2": "na",
+  "ca-central-1": "na",
+  // AWS EU
+  "eu-west-1": "eu", "eu-west-2": "eu", "eu-central-1": "eu", "eu-north-1": "eu",
+  // AWS APAC
+  "ap-southeast-1": "ap", "ap-southeast-2": "ap", "ap-northeast-1": "ap", "ap-northeast-2": "ap",
+};
+
+// Tier distance from `a` to `b`. Lower is closer.
+//   0 — same cloud + same region (cell siblings)
+//   1 — same cloud, different region
+//   2 — different cloud, same continent
+//   3 — anywhere else (different continent, or unknown region)
+function distanceRank(a: CellRow, b: CellRow): number {
+  if (a.cloud === b.cloud && a.region === b.region) return 0;
+  if (a.cloud === b.cloud) return 1;
+  const aCont = REGION_CONTINENT[a.region];
+  const bCont = REGION_CONTINENT[b.region];
+  if (aCont && bCont && aCont === bCont) return 2;
+  return 3;
+}
+
+// pickCell — layered placement.
+//   0. Hard pin from request body (cellId) — strict; if pinned cell is
+//      unhealthy/missing, fail rather than silently fall back.
+//   1. Healthy candidates (status+freshness+available_workers gates).
+//   2. Home cell first, then siblings ordered by tier-distance from home.
+//   3. First candidate with capacity wins.
+// Returns null if nothing is eligible — caller turns that into 503.
+async function pickCell(
+  env: Env,
+  homeCell: string,
+  requestedCellID: string | null,
+): Promise<CellRow | null> {
+  const nowSec = Math.floor(Date.now() / 1000);
+
+  // 0. Hard pin
+  if (requestedCellID) {
+    const c = await lookupCell(env, requestedCellID);
+    return c && isHealthy(c, nowSec) ? c : null;
+  }
+
+  // Look up home regardless of health — we still want its {cloud, region}
+  // as the distance anchor even if home itself is currently loaded.
+  const home = await lookupCell(env, homeCell);
+
+  const { results } = await env.OPENCOMPUTER_DB.prepare(
+    `SELECT cell_id, cloud, region, base_url, status, available_workers, capacity_updated_at
+       FROM cells WHERE status = 'active'`,
+  ).all<CellRow>();
+  const healthy = (results ?? []).filter((c) => isHealthy(c, nowSec));
+  if (healthy.length === 0) return null;
+
+  if (home) {
+    healthy.sort((a, b) => {
+      const da = distanceRank(home, a);
+      const db = distanceRank(home, b);
+      if (da !== db) return da - db;
+      // Tie-break: home wins ties (distance 0 to itself), then alphabetical for
+      // deterministic ordering across cells the same distance from home.
+      if (a.cell_id === home.cell_id) return -1;
+      if (b.cell_id === home.cell_id) return 1;
+      return a.cell_id.localeCompare(b.cell_id);
+    });
+  } else {
+    // Home cell not registered in the table at all — degenerate config; pick
+    // alphabetically rather than randomly so behavior is at least deterministic.
+    healthy.sort((a, b) => a.cell_id.localeCompare(b.cell_id));
+  }
+
+  return healthy[0] ?? null;
 }
 
 // ── route handlers ───────────────────────────────────────────────────────
@@ -136,13 +242,29 @@ async function createSandbox(req: Request, env: Env): Promise<Response> {
     .first<{ home_cell: string }>();
   if (!org) return json({ error: "org not found" }, 401);
 
-  const cell = await lookupCell(env, org.home_cell);
-  if (!cell) return json({ error: `home cell ${org.home_cell} not registered` }, 503);
-  if (cell.status !== "active") return json({ error: `cell ${cell.cell_id} is ${cell.status}` }, 503);
+  // Read body once — used for the hard-pin peek + forwarded to the CP verbatim.
+  const bodyText = await req.text();
+  let requestedCellID: string | null = null;
+  try {
+    if (bodyText) {
+      const parsed = JSON.parse(bodyText) as { cellId?: unknown };
+      if (typeof parsed.cellId === "string") requestedCellID = parsed.cellId;
+    }
+  } catch {
+    /* malformed JSON — let the CP reject with a proper 400 */
+  }
+
+  const cell = await pickCell(env, org.home_cell, requestedCellID);
+  if (!cell) {
+    return json(
+      requestedCellID
+        ? { error: `cell ${requestedCellID} is not available` }
+        : { error: "no cells available with capacity" },
+      503,
+    );
+  }
 
   const capToken = await mintCapToken(env.SESSION_JWT_SECRET, caller.orgID, cell.cell_id, caller.userID);
-
-  const bodyText = await req.text();
   let cpResp: Response;
   try {
     cpResp = await fetch(cell.base_url.replace(/\/$/, "") + "/internal/sandboxes/create", {

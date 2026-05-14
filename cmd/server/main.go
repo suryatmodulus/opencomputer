@@ -190,6 +190,22 @@ func main() {
 		} else if cfg.Mode == "server" {
 			log.Printf("opensandbox: CF event forwarder NOT started (CFEventEndpoint/Secret/CellID unset)")
 		}
+
+		// Capacity reporter — periodically pushes a cell_capacity event onto the
+		// same events:{cell_id} stream the forwarder drains. Feeds the edge's
+		// pickCell() cascade via D1. Inert when CellID is empty.
+		if cfg.CellID != "" {
+			cr, err := controlplane.NewCapacityReporter(controlplane.CapacityReporterConfig{
+				Redis:    redisRegistry.RedisClient(),
+				Registry: redisRegistry,
+				CellID:   cfg.CellID,
+			})
+			if err != nil {
+				log.Fatalf("capacity_reporter: %v", err)
+			}
+			cr.Start(context.Background())
+			defer cr.Stop()
+		}
 	}
 
 	// Initialize compute pool + autoscaler (server mode)

@@ -111,6 +111,21 @@ CREATE TABLE IF NOT EXISTS cells (
   region      TEXT NOT NULL,
   base_url    TEXT NOT NULL,                     -- regional CP base URL (scheme+host[:port])
   status      TEXT NOT NULL DEFAULT 'active',    -- active | draining | down
+  -- Capacity-aware placement (updated by cell_capacity events; see
+  -- internal/controlplane/capacity_reporter.go + events-ingest worker).
+  -- The CP aggregates per-worker memory pressure from WorkerEntry. A cell is
+  -- placement-eligible iff available_workers > 0 AND capacity_updated_at is
+  -- within the freshness window (~120s). NULL/stale capacity_updated_at ⇒ the
+  -- reporting CP is dead, treat the cell as unhealthy regardless of `status`.
+  --
+  -- "available" = worker where committed_memory_mb/total_memory_mb < 85%.
+  -- Single-worker-below-threshold is the right gate because a sandbox lands
+  -- on one worker, not striped across workers — aggregating across the cell
+  -- would wrongly skip a cell with 1 free worker and 9 loaded ones.
+  healthy_workers     INTEGER NOT NULL DEFAULT 0,  -- alive workers in this cell
+  available_workers   INTEGER NOT NULL DEFAULT 0,  -- workers under the mem threshold
+  running_sandboxes   INTEGER NOT NULL DEFAULT 0,  -- observability only, not in placement
+  capacity_updated_at INTEGER,
   created_at  INTEGER NOT NULL
 );
 
