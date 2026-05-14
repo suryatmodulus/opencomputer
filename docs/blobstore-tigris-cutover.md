@@ -16,7 +16,8 @@ the soak window.
 | Data | Old backend | Cutover mechanism |
 |---|---|---|
 | Checkpoints / hibernation archives / templates | Azure Blob | rclone bulk copy + FallbackStore in migration mode |
-| Goldens (`bases/<version>/default.ext4`) | Azure Blob | same |
+| Goldens — existing (`bases/<old-versions>/default.ext4`) | Azure Blob | rclone bulk copy (they live in the same container as checkpoints) |
+| Goldens — new ones produced by future AMI bakes | Azure Blob | **AMI bake dual-writes to both Azure and Tigris** until Phase 5 |
 | pg-backups / pg-wal | Azure Blob | Out of scope (managed by separate path) |
 
 All worker-managed paths flow through `internal/blobstore.Store`, so a
@@ -57,20 +58,37 @@ required for binary or system-level changes.
   `opencomputer-prod`, fallback uses Azure container `checkpoints`,
   configured via `OPENSANDBOX_S3_FALLBACK_BUCKET`
 
-## Phase 1 — Ship the new binary (one AMI bake)
+## Phase 1 — Ship the new binary + start dual-writing goldens
 
-**Goal**: get the new code into the worker pool. No behavior change yet
-(`OPENSANDBOX_S3_FALLBACK_*` unset means workers log "no fallback" and
-behave identically to before).
+**Goal**: get the new code into the worker pool AND start uploading each
+new AMI's golden to Tigris in parallel with Azure. No worker behavior
+change yet (`OPENSANDBOX_S3_FALLBACK_*` unset means workers log "no
+fallback" and behave identically to before).
 
-1. Merge the PR.
-2. CI builds a new worker AMI (`.github/workflows/build-worker-ami.yml`)
-   and bumps KV `worker-image-version`.
-3. Scaler does its normal rolling-replace.
-4. Verify all workers report the new version via `GET /api/workers`.
-5. Smoke test: create / hibernate / wake. Behavior identical.
+1. Before merging: stash Tigris creds in GitHub Actions secrets used by
+   `build-worker-ami.yml`:
+   - `TIGRIS_ENDPOINT` = `https://t3.storage.dev`
+   - `TIGRIS_ACCESS_KEY_ID` = `tid_...`
+   - `TIGRIS_SECRET_ACCESS_KEY` = `tsec_...`
+   - `TIGRIS_GOLDENS_BUCKET` = `opencomputer-prod`
+2. Merge the PR.
+3. CI builds a new worker AMI. The bake now performs **two** golden
+   uploads:
+   - Existing Python step → Azure container `checkpoints` (unchanged)
+   - New step → Tigris bucket `opencomputer-prod` via
+     `opensandbox-worker golden-upload` (skips silently if Tigris secrets
+     aren't set, so this is safe on dev/PR branches that don't have them)
+4. CI bumps KV `worker-image-version`. Scaler does rolling-replace.
+5. Verify all workers report the new version via `GET /api/workers`.
+6. Smoke test: create / hibernate / wake. Behavior identical.
+7. Verify the new golden landed in Tigris:
+   ```
+   tigris ls "opencomputer-prod/bases/$(<the hash from packer output>)/"
+   ```
+   Should show `default.ext4` at the expected size.
 
-**Rollback**: bump KV `worker-image-version` back. Scaler rolls back.
+**Rollback**: bump KV `worker-image-version` back. Scaler rolls back. The
+Tigris-uploaded golden stays in Tigris as a no-op (no reader yet).
 
 ## Phase 2 — Bulk rclone Azure → Tigris
 
@@ -161,13 +179,19 @@ Monitor:
 If fallback hit rate stays elevated, run another delta rclone sync to
 warm cold keys into Tigris proactively.
 
-## Phase 5 — Disable fallback (commit to Tigris)
+## Phase 5 — Disable fallback + drop Azure golden upload (commit to Tigris)
 
 1. Edit `server.env`: remove the `OPENSANDBOX_S3_FALLBACK_*` block and
    `OPENSANDBOX_BLOB_MIGRATION_MODE`.
 2. Restart CP.
 3. Cycle workers (same options as Phase 3 step 4).
 4. Verify log: `checkpoint store: tigris primary (no fallback)`.
+5. **Remove the Python Azure-upload step from `deploy/packer/worker-ami.pkr.hcl`.**
+   At this point Tigris is the authoritative store and Azure shouldn't
+   receive new writes. The Tigris-upload step stays.
+6. Optionally also remove the "download previous golden from Azure" step
+   and replace with a Tigris fetch (or accept the runtime fetch cost for
+   forks of stale-pinned checkpoints, which should be rare).
 
 **Rollback past this point** is harder. Re-adding the fallback re-enables
 the safety net, but any keys written to Tigris during the no-fallback
