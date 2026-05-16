@@ -30,12 +30,11 @@ const orphanGraceTermDelay = 5 * time.Second
 // that window kills the in-progress operation: the caller observes
 // "QMP cont: write: broken pipe" or "agent not ready after 10s".
 //
-// Treat too-young processes as off-limits. If they're genuinely orphaned
-// (e.g. wake crashed silently between cmd.Start and m.vms registration), a
-// later sweep will catch them once they age past the grace window. The cost
-// of waiting one extra sweep on a real orphan is bounded — they linger 60s
-// longer than they would have otherwise.
-const orphanYoungProcessGrace = 2 * time.Minute
+// 5 min is ~10× the worst observed wake; future slowdowns (bigger archives,
+// slower network, more contention) won't re-expose the race. Real orphans
+// linger up to ~5 min longer than before the fix — fine, they accrued for
+// hours silently before this reaper existed at all.
+const orphanYoungProcessGrace = 5 * time.Minute
 
 // sandboxIDRe extracts an sb-xxxxxxxx sandbox ID from a qemu command line.
 // QEMU's cmdline embeds the sandboxDir as a -drive file=… and -chardev path=…
