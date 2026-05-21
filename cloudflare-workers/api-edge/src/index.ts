@@ -496,10 +496,14 @@ async function getSandbox(req: Request, env: Env, id: string): Promise<Response>
 // when the SDK's API key didn't exist in cell PG (api_keys are global in D1
 // now, not mirrored per-cell).
 async function proxyToCellSDK(req: Request, env: Env, ctx: ExecutionContext, caller: Caller, id: string): Promise<Response> {
-  const row = await env.OPENCOMPUTER_DB.prepare("SELECT cell_id FROM sandboxes_index WHERE id = ?1")
+  const row = await env.OPENCOMPUTER_DB.prepare("SELECT cell_id, org_id FROM sandboxes_index WHERE id = ?1")
     .bind(id)
-    .first<{ cell_id: string }>();
-  if (!row) return json({ error: "sandbox not found" }, 404);
+    .first<{ cell_id: string; org_id: string }>();
+  // Authorization: the sandbox must belong to the caller's org. Without this,
+  // any authenticated org could exec/files/pty/delete/hibernate/wake another
+  // org's sandbox by id (the cell trusts the edge for authz). 404 not 403 so
+  // we don't leak which sandbox ids exist.
+  if (!row || row.org_id !== caller.orgID) return json({ error: "sandbox not found" }, 404);
   const cell = await lookupCell(env, row.cell_id);
   if (!cell) return json({ error: `cell ${row.cell_id} not registered` }, 503);
 

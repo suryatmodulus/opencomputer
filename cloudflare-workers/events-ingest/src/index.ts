@@ -205,16 +205,20 @@ export default {
     // sandbox_checkpoints. CP emits checkpoint_ready after SetCheckpointReady
     // (UPSERT all fields) and checkpoint_deleted after DeleteCheckpoint. The
     // dashboard cross-cell list + the edge's spawn-from-checkpoint routing
-    // both depend on this table being populated.
+    // both depend on this table being populated. golden_hash is write-once:
+    // it pins the checkpoint to its base golden, so the upsert fills a
+    // previously-empty row but never overwrites a set value — changing it
+    // would rebase the delta onto the wrong base and break restore.
     const checkpointUpsert = env.OPENCOMPUTER_DB.prepare(
       `INSERT INTO checkpoints_index
          (id, sandbox_id, org_id, owner_cell_id, s3_url, size_bytes, golden_hash, workspace_size, created_at)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', NULL, ?7)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8)
        ON CONFLICT(id) DO UPDATE SET
          sandbox_id    = excluded.sandbox_id,
          owner_cell_id = excluded.owner_cell_id,
          s3_url        = excluded.s3_url,
-         size_bytes    = excluded.size_bytes`,
+         size_bytes    = excluded.size_bytes,
+         golden_hash   = CASE WHEN checkpoints_index.golden_hash = '' THEN excluded.golden_hash ELSE checkpoints_index.golden_hash END`,
     );
     const checkpointDelete = env.OPENCOMPUTER_DB.prepare(
       `DELETE FROM checkpoints_index WHERE id = ?1`,
@@ -227,6 +231,7 @@ export default {
           rootfs_s3_key?: string;
           workspace_s3_key?: string;
           size_bytes?: number;
+          golden_hash?: string;
         };
         if (!p.checkpoint_id) return [];
         if (e.type === "checkpoint_deleted") {
@@ -244,6 +249,7 @@ export default {
             e.cell_id,
             p.rootfs_s3_key ?? "",
             p.size_bytes ?? null,
+            p.golden_hash ?? "",
             tsSec,
           ),
         ];

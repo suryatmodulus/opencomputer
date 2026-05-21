@@ -9,7 +9,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"github.com/opensandbox/opensandbox/internal/sandbox"
 )
@@ -206,7 +205,11 @@ func (p *RedisEventPublisher) FlushSandbox(ctx context.Context, sandboxID string
 			ts = time.Now()
 		}
 		envelope := SandboxEventEnvelope{
-			ID:        uuid.NewString(),
+			// Deterministic id: a re-publish (XADD succeeded but MarkSynced
+			// didn't — crash/timeout) must collide with the prior id so the
+			// downstream D1 `ON CONFLICT(id) DO NOTHING` dedups it. A fresh
+			// UUID per attempt would double-apply (e.g. usage_tick → double debit).
+			ID:        fmt.Sprintf("%s:%d", sandboxID, e.ID),
 			Type:      e.Type,
 			SandboxID: sandboxID,
 			OrgID:     orgID,
@@ -257,7 +260,8 @@ func (p *RedisEventPublisher) flush(ctx context.Context) {
 
 	for _, se := range events {
 		envelope := SandboxEventEnvelope{
-			ID:        uuid.NewString(),
+			// Deterministic id (see FlushSandbox) so retries dedup downstream.
+			ID:        fmt.Sprintf("%s:%d", se.SandboxID, se.Event.ID),
 			Type:      se.Event.Type,
 			SandboxID: se.SandboxID,
 			WorkerID:  p.workerID,

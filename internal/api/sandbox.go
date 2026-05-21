@@ -526,6 +526,11 @@ func (s *Server) createSandboxRemote(c echo.Context, ctx context.Context, cfg ty
 	tmpl, err := s.resolveTemplate(ctx, orgID, hasOrg, cfg.Template)
 	if err != nil {
 		log.Printf("sandbox: template %q lookup failed: %v", cfg.Template, err)
+		// Don't silently fall back to a blank default sandbox when the caller
+		// explicitly asked for a template — surface the failure.
+		if cfg.Template != "" {
+			return c.JSON(http.StatusBadGateway, map[string]string{"error": "template lookup failed for " + cfg.Template + ": " + err.Error()})
+		}
 	} else if tmpl != nil {
 		templateID = &tmpl.ID
 		log.Printf("sandbox: resolved template %q (type=%s, id=%s)", cfg.Template, tmpl.TemplateType, tmpl.ID)
@@ -534,6 +539,9 @@ func (s *Server) createSandboxRemote(c echo.Context, ctx context.Context, cfg ty
 			templateWorkspaceKey = *tmpl.WorkspaceS3Key
 			log.Printf("sandbox: using snapshot template drives: rootfs=%s, workspace=%s", templateRootfsKey, templateWorkspaceKey)
 		}
+	} else if cfg.Template != "" {
+		// Requested a template by name but it didn't resolve (not found).
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "template not found: " + cfg.Template})
 	}
 
 	// Dispatch via persistent gRPC connection.
@@ -2157,10 +2165,18 @@ func (s *Server) createCheckpoint(c echo.Context) error {
 			// Pre-fix this was hardcoded to 0, leaving size_bytes meaningless.
 			_ = s.store.SetCheckpointReady(context.Background(), checkpointID, grpcResp.RootfsS3Key, grpcResp.WorkspaceS3Key, grpcResp.SizeBytes)
 			log.Printf("api: checkpoint %s ready (size=%d bytes)", checkpointID, grpcResp.SizeBytes)
+			golden := ""
+			if session.GoldenVersion != nil {
+				golden = *session.GoldenVersion
+			}
 			s.publishCheckpointEvent(context.Background(), "checkpoint_ready", checkpointID, sandboxID, orgID, session.WorkerID, map[string]any{
 				"rootfs_s3_key":    grpcResp.RootfsS3Key,
 				"workspace_s3_key": grpcResp.WorkspaceS3Key,
 				"size_bytes":       grpcResp.SizeBytes,
+				// golden_hash pins the checkpoint to its base golden so D1
+				// checkpoints_index rows created from this event are spawn-routable
+				// (matches what the backfill stores from sandbox_sessions.golden_version).
+				"golden_hash": golden,
 			})
 		}()
 	} else if s.manager != nil {
@@ -2181,10 +2197,15 @@ func (s *Server) createCheckpoint(c echo.Context) error {
 			}
 			_ = s.store.SetCheckpointReady(context.Background(), checkpointID, rootfsKey, workspaceKey, sizeBytes)
 			log.Printf("api: checkpoint %s ready (size=%d bytes)", checkpointID, sizeBytes)
+			golden := ""
+			if session.GoldenVersion != nil {
+				golden = *session.GoldenVersion
+			}
 			s.publishCheckpointEvent(context.Background(), "checkpoint_ready", checkpointID, sandboxID, orgID, session.WorkerID, map[string]any{
 				"rootfs_s3_key":    rootfsKey,
 				"workspace_s3_key": workspaceKey,
 				"size_bytes":       sizeBytes,
+				"golden_hash":      golden,
 			})
 		}()
 	} else {
