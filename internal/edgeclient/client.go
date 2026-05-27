@@ -258,21 +258,26 @@ func (c *Client) UpdateTemplateStatus(ctx context.Context, id uuid.UUID, status 
 
 // ── Secret stores ──────────────────────────────────────────────────────
 
+// edgeStore intentionally omits createdAt / updatedAt. The edge worker
+// serializes those as ISO strings (per the /api/secret-stores contract the
+// CLI relies on) and applySecretBundle never reads them downstream, so
+// declaring them as int64 here just blew up json.Unmarshal with
+// "cannot unmarshal string into Go struct field edgeStore.store.createdAt
+// of type int64", killing every sandbox-create bound to a secret store.
+// Extra JSON fields are silently dropped by encoding/json.
 type edgeStore struct {
 	ID              string   `json:"id"`
 	OrgID           string   `json:"orgID"`
 	Name            string   `json:"name"`
 	EgressAllowlist []string `json:"egressAllowlist"`
-	CreatedAt       int64    `json:"createdAt"`
-	UpdatedAt       int64    `json:"updatedAt"`
 }
 
+// edgeEntry mirrors the same omission for consistency with edgeStore — entry
+// timestamps were unread on the CP side anyway.
 type edgeEntry struct {
 	Name              string   `json:"name"`
 	AllowedHosts      []string `json:"allowedHosts"`
 	EncryptedValueB64 string   `json:"encryptedValueB64"`
-	CreatedAt         int64    `json:"createdAt"`
-	UpdatedAt         int64    `json:"updatedAt"`
 }
 
 type edgeStoreBundle struct {
@@ -318,8 +323,9 @@ func (c *Client) lookupStoreByQuery(ctx context.Context, query string, enc *cryp
 			OrgID:           orgID,
 			Name:            raw.Store.Name,
 			EgressAllowlist: raw.Store.EgressAllowlist,
-			CreatedAt:       time.Unix(raw.Store.CreatedAt, 0),
-			UpdatedAt:       time.Unix(raw.Store.UpdatedAt, 0),
+			// CreatedAt/UpdatedAt left zero — never consumed by applySecretBundle
+			// or any other caller of SecretStoreBundle. See edgeStore comment
+			// for why we no longer decode them.
 		},
 	}
 	for _, e := range raw.Entries {
