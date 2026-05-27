@@ -777,19 +777,40 @@ func (s *Store) FailMigrationPostQMP(ctx context.Context, sandboxID, errorMsg st
 	return err
 }
 
+// OrphanedSandbox is one row affected by MarkOrphanedOnWorker /
+// MarkOrphanedSandboxes — callers use these to emit downstream `stopped`
+// events so D1 sandboxes_index mirrors the PG state change (without an
+// event, D1 drifts).
+type OrphanedSandbox struct {
+	SandboxID string
+	OrgID     uuid.UUID
+	WorkerID  string
+}
+
 // MarkOrphanedOnWorker marks any still-running/migrating sandboxes pointing at the given worker
 // as error. Called when drain finishes to sweep up rows the per-sandbox migration failure paths
 // missed — e.g. a sandbox that vanished from the worker (failed migration cleanup) but whose DB
-// row still references the worker.
-func (s *Store) MarkOrphanedOnWorker(ctx context.Context, workerID, errorMsg string) (int, error) {
-	tag, err := s.pool.Exec(ctx,
+// row still references the worker. Returns the affected (sandbox_id, org_id) pairs so the
+// caller can publish `stopped` events; without them, D1 keeps the row at `running`.
+func (s *Store) MarkOrphanedOnWorker(ctx context.Context, workerID, errorMsg string) ([]OrphanedSandbox, error) {
+	rows, err := s.pool.Query(ctx,
 		`UPDATE sandbox_sessions SET status = 'error', migrating_to_worker = '', stopped_at = now(), error_msg = $2
-		 WHERE worker_id = $1 AND status IN ('running', 'migrating')`,
+		 WHERE worker_id = $1 AND status IN ('running', 'migrating')
+		 RETURNING sandbox_id, org_id, worker_id`,
 		workerID, errorMsg)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	return int(tag.RowsAffected()), nil
+	defer rows.Close()
+	var orphans []OrphanedSandbox
+	for rows.Next() {
+		var o OrphanedSandbox
+		if err := rows.Scan(&o.SandboxID, &o.OrgID, &o.WorkerID); err != nil {
+			return nil, err
+		}
+		orphans = append(orphans, o)
+	}
+	return orphans, rows.Err()
 }
 
 // RecoverStaleMigrations resets any sandbox stuck in 'migrating' status for more than the given duration.
@@ -804,18 +825,19 @@ func (s *Store) RecoverStaleMigrations(ctx context.Context, maxAge time.Duration
 	return int(tag.RowsAffected()), nil
 }
 
-// MarkOrphanedSandboxes marks running sandboxes on dead workers as error.
-// liveWorkers is the set of worker IDs currently registered.
-func (s *Store) MarkOrphanedSandboxes(ctx context.Context, liveWorkers map[string]bool) (int, error) {
-	// Get all distinct worker_ids with running sandboxes
+// MarkOrphanedSandboxes marks running sandboxes on dead workers as error
+// and returns the affected (sandbox_id, org_id, worker_id) tuples so the
+// caller can publish `stopped` lifecycle events. liveWorkers is the set
+// of worker IDs currently registered. Without the returned IDs the maintenance
+// loop's PG sweep would never reach D1 sandboxes_index, which is exactly
+// the post-cutover ghost-row bug.
+func (s *Store) MarkOrphanedSandboxes(ctx context.Context, liveWorkers map[string]bool) ([]OrphanedSandbox, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT DISTINCT worker_id FROM sandbox_sessions WHERE status = 'running'`)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	defer rows.Close()
-
-	total := 0
+	deadWorkers := make([]string, 0)
 	for rows.Next() {
 		var workerID string
 		if err := rows.Scan(&workerID); err != nil {
@@ -824,15 +846,28 @@ func (s *Store) MarkOrphanedSandboxes(ctx context.Context, liveWorkers map[strin
 		if liveWorkers[workerID] {
 			continue
 		}
-		// Worker not in registry — mark its sandboxes as error
-		tag, err := s.pool.Exec(ctx,
-			`UPDATE sandbox_sessions SET status = 'error', error_msg = 'worker lost', stopped_at = now()
-			 WHERE worker_id = $1 AND status = 'running'`, workerID)
-		if err == nil {
-			total += int(tag.RowsAffected())
-		}
+		deadWorkers = append(deadWorkers, workerID)
 	}
-	return total, nil
+	rows.Close()
+
+	var orphans []OrphanedSandbox
+	for _, workerID := range deadWorkers {
+		upd, err := s.pool.Query(ctx,
+			`UPDATE sandbox_sessions SET status = 'error', error_msg = 'worker lost', stopped_at = now()
+			 WHERE worker_id = $1 AND status = 'running'
+			 RETURNING sandbox_id, org_id, worker_id`, workerID)
+		if err != nil {
+			continue
+		}
+		for upd.Next() {
+			var o OrphanedSandbox
+			if err := upd.Scan(&o.SandboxID, &o.OrgID, &o.WorkerID); err == nil {
+				orphans = append(orphans, o)
+			}
+		}
+		upd.Close()
+	}
+	return orphans, nil
 }
 
 func (s *Store) GetSandboxSession(ctx context.Context, sandboxID string) (*SandboxSession, error) {

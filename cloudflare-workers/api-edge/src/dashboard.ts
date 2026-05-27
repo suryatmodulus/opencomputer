@@ -969,11 +969,12 @@ export async function handleDashboard(
   // dashboard renders instead of 404-erroring on a missing route.
   if (sub === "/billing" && method === "GET") {
     const org = await env.OPENCOMPUTER_DB.prepare(
-      `SELECT plan, stripe_customer_id, stripe_subscription_id, free_credits_remaining_cents, credit_balance_cents, is_halted
+      `SELECT plan, stripe_customer_id, stripe_subscription_id, free_credits_remaining_cents, credit_balance_cents, is_halted, max_concurrent_sandboxes
          FROM orgs WHERE id = ?1`,
     ).bind(caller.orgID).first<{
       plan: string; stripe_customer_id: string | null; stripe_subscription_id: string | null;
       free_credits_remaining_cents: number; credit_balance_cents: number; is_halted: number;
+      max_concurrent_sandboxes: number;
     }>();
     if (!org) return json({ error: "org not found" }, 404);
     // Cross-check against the live DO state — the D1 mirror gets written by
@@ -1005,6 +1006,7 @@ export async function handleDashboard(
       freeCreditsRemainingCents: liveBalance,
       creditBalanceCents: org.credit_balance_cents,
       isHalted: !!org.is_halted,
+      maxConcurrentSandboxes: org.max_concurrent_sandboxes,
       // Upcoming-invoice + meters would come from Stripe API on demand;
       // surface stubs for now so the UI has stable keys to render against.
       upcomingInvoice: null,

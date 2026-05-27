@@ -1267,6 +1267,30 @@ export default {
       return proxyToCellSDK(req, env, ctx, caller, id);
     }
 
+    // Generic /api/* fallback proxy — routes unmatched dashboard endpoints
+    // (/api/images, /api/sessions, /api/me, /api/workers, /api/checkpoints,
+    // /api/api-keys, /api/org*, /api/agents, /api/billing*, etc.) to the
+    // home cell's CP. These were served by the CP pre-cutover; the edge
+    // doesn't have native handlers for them yet. The CP does its own auth
+    // (X-API-Key or session JWT) — we just pass through.
+    if (path.startsWith("/api/")) {
+      const cellRow = await env.OPENCOMPUTER_DB.prepare(
+        `SELECT cell_id, cloud, region, base_url, status, available_workers, capacity_updated_at
+           FROM cells WHERE status = 'active' LIMIT 1`,
+      ).first<CellRow>();
+      if (!cellRow) return json({ error: "no active cell" }, 503);
+      const target = cellRow.base_url.replace(/\/$/, "") + url.pathname + url.search;
+      const proxyHeaders = new Headers(req.headers);
+      proxyHeaders.set("X-Forwarded-Host", url.host);
+      const proxyReq = new Request(target, {
+        method: req.method,
+        headers: proxyHeaders,
+        body: ["GET", "HEAD"].includes(req.method) ? null : req.body,
+        redirect: "manual",
+      });
+      return fetch(proxyReq);
+    }
+
     // Anything not matched above is the dashboard SPA — delegate to the
     // assets binding. run_worker_first=true in wrangler.toml means CF runs
     // this Worker before checking assets, so we have to explicitly hand
