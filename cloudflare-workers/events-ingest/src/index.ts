@@ -189,15 +189,18 @@ export default {
         const tsSec = Math.floor((Date.parse(e.timestamp) || Date.now()) / 1000);
         if (e.type === "stopped") return lifecycleStopped.bind(tsSec, e.sandbox_id);
         if (e.type === "hibernated") return lifecycleHibernated.bind(tsSec, e.sandbox_id);
-        if (e.type === "migrated") {
-          // worker_id moves with the sandbox; payload carries the new one
-          // (the CP-side publishSandboxLifecycleEvent uses the envelope's
-          // worker_id field rather than payload for migrated events).
+        if (e.type === "migrated" || e.type === "woke") {
+          // worker_id moves with the sandbox. For "migrated" the scaler
+          // set the new owner; for "woke" the wake handler set it (a
+          // sandbox that hibernated on worker A can wake on worker B
+          // after a rolling replace — without this D1 keeps showing A).
+          // The CP-side publishSandboxLifecycleEvent uses the envelope's
+          // worker_id field rather than payload for these events.
           return lifecycleMigrated.bind(e.worker_id ?? "", tsSec, e.sandbox_id);
         }
-        // "running", "woke", "created" all set the row to running (created
-        // is handled by the edge on POST, but accept here for redundancy
-        // in case of replay against a future cell-only create path).
+        // "running", "created" set the row to running (created is handled
+        // by the edge on POST, but accept here for redundancy in case of
+        // replay against a future cell-only create path).
         return lifecycleRunning.bind(tsSec, e.sandbox_id);
       });
 
