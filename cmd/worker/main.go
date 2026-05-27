@@ -15,10 +15,12 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/opensandbox/opensandbox/internal/analytics"
 	"github.com/opensandbox/opensandbox/internal/auth"
 	"github.com/opensandbox/opensandbox/internal/blobstore"
+	"github.com/opensandbox/opensandbox/internal/cellevents"
 	"github.com/opensandbox/opensandbox/internal/config"
 	"github.com/opensandbox/opensandbox/internal/db"
 	"github.com/opensandbox/opensandbox/internal/metrics"
@@ -426,11 +428,33 @@ func main() {
 			defer store.Close()
 			log.Println("opensandbox-worker: PostgreSQL store connected (auto-wake enabled)")
 
-			_, stopped, err := store.ReconcileWorkerSessions(ctx, cfg.WorkerID)
+			hibernated, stopped, err := store.ReconcileWorkerSessions(ctx, cfg.WorkerID)
 			if err != nil {
 				log.Printf("opensandbox-worker: warning: session reconciliation failed: %v", err)
-			} else if stopped > 0 {
-				log.Printf("opensandbox-worker: reconciled %d unrecoverable sessions as stopped", stopped)
+			} else {
+				if len(stopped) > 0 {
+					log.Printf("opensandbox-worker: reconciled %d unrecoverable sessions as stopped", len(stopped))
+				}
+				if len(hibernated) > 0 {
+					log.Printf("opensandbox-worker: reconciled %d sessions as hibernated", len(hibernated))
+				}
+				// Mirror PG state changes to D1 via the cell events stream.
+				// Without these XADDs, the dashboard keeps the rows at the
+				// pre-restart state ("running" on a worker that just rebooted).
+				// Brief redis client just for the emit; heartbeat + event
+				// publisher create their own later in startup.
+				if cfg.RedisURL != "" && cfg.CellID != "" && (len(hibernated) > 0 || len(stopped) > 0) {
+					if opts, optErr := redis.ParseURL(cfg.RedisURL); optErr == nil {
+						emitRDB := redis.NewClient(opts)
+						for _, o := range hibernated {
+							cellevents.PublishLifecycle(ctx, emitRDB, cfg.CellID, "hibernated", o.SandboxID, o.WorkerID, o.OrgID, "worker_restart")
+						}
+						for _, o := range stopped {
+							cellevents.PublishLifecycle(ctx, emitRDB, cfg.CellID, "stopped", o.SandboxID, o.WorkerID, o.OrgID, "worker_restart")
+						}
+						_ = emitRDB.Close()
+					}
+				}
 			}
 
 			// Wire up metadata server billing callback
@@ -676,8 +700,22 @@ func main() {
 					fixed, err := store.ReconcileWorkerReconnect(context.Background(), cfg.WorkerID, runningIDs)
 					if err != nil {
 						log.Printf("opensandbox-worker: reconnect reconciliation failed: %v", err)
-					} else if fixed > 0 {
-						log.Printf("opensandbox-worker: reconnect reconciliation: %d sessions restored to running", fixed)
+					} else if len(fixed) > 0 {
+						log.Printf("opensandbox-worker: reconnect reconciliation: %d sessions restored to running", len(fixed))
+						// Mirror to D1: emit `running` events so the dashboard
+						// reflects the recovery. Without these, D1 keeps the
+						// `error` status from the maintenance loop's previous
+						// sweep — customer sees their sandbox as broken until
+						// the next state-changing event.
+						if cfg.RedisURL != "" && cfg.CellID != "" {
+							if opts, optErr := redis.ParseURL(cfg.RedisURL); optErr == nil {
+								emitRDB := redis.NewClient(opts)
+								for _, o := range fixed {
+									cellevents.PublishLifecycle(context.Background(), emitRDB, cfg.CellID, "running", o.SandboxID, o.WorkerID, o.OrgID, "worker_reconnect")
+								}
+								_ = emitRDB.Close()
+							}
+						}
 					}
 				})
 			}
