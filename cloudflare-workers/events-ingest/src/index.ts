@@ -211,14 +211,15 @@ export default {
     // would rebase the delta onto the wrong base and break restore.
     const checkpointUpsert = env.OPENCOMPUTER_DB.prepare(
       `INSERT INTO checkpoints_index
-         (id, sandbox_id, org_id, owner_cell_id, s3_url, size_bytes, golden_hash, workspace_size, created_at)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8)
+         (id, sandbox_id, org_id, owner_cell_id, s3_url, size_bytes, golden_hash, workspace_size, created_at, name)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9)
        ON CONFLICT(id) DO UPDATE SET
          sandbox_id    = excluded.sandbox_id,
          owner_cell_id = excluded.owner_cell_id,
          s3_url        = excluded.s3_url,
          size_bytes    = excluded.size_bytes,
-         golden_hash   = CASE WHEN checkpoints_index.golden_hash = '' THEN excluded.golden_hash ELSE checkpoints_index.golden_hash END`,
+         golden_hash   = CASE WHEN checkpoints_index.golden_hash = '' THEN excluded.golden_hash ELSE checkpoints_index.golden_hash END,
+         name          = CASE WHEN excluded.name IS NULL OR excluded.name = '' THEN checkpoints_index.name ELSE excluded.name END`,
     );
     const checkpointDelete = env.OPENCOMPUTER_DB.prepare(
       `DELETE FROM checkpoints_index WHERE id = ?1`,
@@ -232,6 +233,7 @@ export default {
           workspace_s3_key?: string;
           size_bytes?: number;
           golden_hash?: string;
+          name?: string;
         };
         if (!p.checkpoint_id) return [];
         if (e.type === "checkpoint_deleted") {
@@ -239,7 +241,9 @@ export default {
         }
         // checkpoint_ready — use rootfs_s3_key as the canonical s3_url since
         // it's the rootfs delta the worker pulls at spawn time. The workspace
-        // key is reachable from the rootfs metadata.
+        // key is reachable from the rootfs metadata. `name` is the user-set
+        // label; pre-fix the dashboard derived it from rootfs_s3_key, which
+        // always ended in "rootfs.tar.zst".
         const tsSec = Math.floor((Date.parse(e.timestamp) || Date.now()) / 1000);
         return [
           checkpointUpsert.bind(
@@ -251,6 +255,7 @@ export default {
             p.size_bytes ?? null,
             p.golden_hash ?? "",
             tsSec,
+            p.name ?? null,
           ),
         ];
       });
