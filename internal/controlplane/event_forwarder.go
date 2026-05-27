@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -167,30 +168,94 @@ func (f *EventForwarder) reclaimLoop(ctx context.Context) {
 	}
 }
 
+// reclaimOnce recovers messages whose previous owning consumer died (e.g. a CP
+// restart left entries in the PEL). XAUTOCLAIM would be the one-shot way to do
+// this but Azure Cache for Redis 6.0 — what prod runs on — doesn't ship that
+// command (6.2+ only). Trying it produced "ERR unknown command 'xautoclaim'"
+// every 30s and left 60+ events stranded after the post-cutover CP restart,
+// which in turn blocked the dashboard's checkpoint/image lists from catching up.
+// Replacement is the legacy two-step: XPENDING to enumerate stale entries by
+// idle time, then XCLAIM to take ownership. Same semantics, same MinIdle gate,
+// works on every Redis version since 5.0.
 func (f *EventForwarder) reclaimOnce(ctx context.Context) {
-	start := "0-0"
+	start := "-"
+	const batch = 100
 	for {
-		msgs, nextStart, err := f.rdb.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+		pending, err := f.rdb.XPendingExt(ctx, &redis.XPendingExtArgs{
+			Stream: f.streamKey,
+			Group:  f.groupName,
+			Idle:   60 * time.Second,
+			Start:  start,
+			End:    "+",
+			Count:  batch,
+		}).Result()
+		if err != nil {
+			log.Printf("event_forwarder: XPENDING error: %v", err)
+			return
+		}
+		if len(pending) == 0 {
+			return
+		}
+		ids := make([]string, 0, len(pending))
+		for _, p := range pending {
+			ids = append(ids, p.ID)
+		}
+		msgs, err := f.rdb.XClaim(ctx, &redis.XClaimArgs{
 			Stream:   f.streamKey,
 			Group:    f.groupName,
 			Consumer: f.consumer,
 			MinIdle:  60 * time.Second,
-			Start:    start,
-			Count:    100,
+			Messages: ids,
 		}).Result()
 		if err != nil {
-			log.Printf("event_forwarder: XAUTOCLAIM error: %v", err)
+			log.Printf("event_forwarder: XCLAIM error (%d ids): %v", len(ids), err)
 			return
 		}
-		if len(msgs) == 0 {
+		if len(msgs) > 0 {
+			f.processBatch(ctx, msgs)
+		}
+		// Next page starts strictly after the last id we just processed; if the
+		// batch was short, we're done.
+		if len(pending) < batch {
 			return
 		}
-		f.processBatch(ctx, msgs)
-		if nextStart == "0-0" || nextStart == "" {
+		// Append "-0" terminator-free? Redis IDs are inclusive on both ends; the
+		// stream-id immediately following N-S is N-(S+1). Using the last id + " "
+		// is wrong — use the exclusive form "(<id>" introduced in Redis 6.2 if
+		// available, else fall back to bumping the sequence. Bumping is safer
+		// across versions: split ms-seq, increment seq, format back.
+		last := pending[len(pending)-1].ID
+		start = bumpStreamID(last)
+		if start == "" {
 			return
 		}
-		start = nextStart
 	}
+}
+
+// bumpStreamID returns the stream id immediately after the given one. Redis
+// stream ids are "<ms>-<seq>"; the next id is "<ms>-<seq+1>". Used so the
+// next XPENDING window doesn't re-fetch the entry we just processed.
+func bumpStreamID(id string) string {
+	dash := -1
+	for i := len(id) - 1; i >= 0; i-- {
+		if id[i] == '-' {
+			dash = i
+			break
+		}
+	}
+	if dash <= 0 || dash == len(id)-1 {
+		return ""
+	}
+	msPart := id[:dash]
+	seqPart := id[dash+1:]
+	seq := 0
+	for _, c := range seqPart {
+		if c < '0' || c > '9' {
+			return ""
+		}
+		seq = seq*10 + int(c-'0')
+	}
+	return msPart + "-" + strconv.Itoa(seq+1)
 }
 
 // processBatch serializes a batch and dispatches via the CF client. Acks on
