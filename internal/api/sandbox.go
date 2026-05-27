@@ -2189,6 +2189,10 @@ func (s *Server) createCheckpoint(c echo.Context) error {
 				// checkpoints_index rows created from this event are spawn-routable
 				// (matches what the backfill stores from sandbox_sessions.golden_version).
 				"golden_hash": golden,
+				// User-set name. Without this, dashboard's checkpoints page
+				// fell back to deriving from rootfs_s3_key, which always ends
+				// in "rootfs.tar.zst" — every row showed the same name.
+				"name": req.Name,
 			})
 		}()
 	} else if s.manager != nil {
@@ -2218,6 +2222,7 @@ func (s *Server) createCheckpoint(c echo.Context) error {
 				"workspace_s3_key": workspaceKey,
 				"size_bytes":       sizeBytes,
 				"golden_hash":      golden,
+				"name":             req.Name,
 			})
 		}()
 	} else {

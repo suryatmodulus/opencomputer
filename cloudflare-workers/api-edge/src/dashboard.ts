@@ -680,12 +680,13 @@ async function handleListCheckpoints(req: Request, env: DashboardEnv, caller: Ca
     const offset = (page - 1) * perPage;
 
     const { results } = await env.OPENCOMPUTER_DB.prepare(
-      `SELECT id, sandbox_id, owner_cell_id, s3_url, size_bytes, golden_hash, workspace_size, created_at, expires_at
+      `SELECT id, sandbox_id, owner_cell_id, s3_url, size_bytes, golden_hash, workspace_size, created_at, expires_at, name
          FROM checkpoints_index WHERE org_id = ?1 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3`,
     ).bind(caller.orgID, perPage, offset).all<{
       id: string; sandbox_id: string; owner_cell_id: string; s3_url: string | null;
       size_bytes: number | null; golden_hash: string | null; workspace_size: number | null;
       created_at: number; expires_at: number | null;
+      name: string | null;
     }>();
     const totalRow = await env.OPENCOMPUTER_DB.prepare(`SELECT COUNT(*) AS c FROM checkpoints_index WHERE org_id = ?1`).bind(caller.orgID).first<{ c: number }>();
     return json({
@@ -693,7 +694,11 @@ async function handleListCheckpoints(req: Request, env: DashboardEnv, caller: Ca
         id: r.id,
         sandboxId: r.sandbox_id ?? "",
         orgId: caller.orgID,
-        name: (r.s3_url ?? "").split("/").filter(Boolean).pop() || r.id,
+        // Prefer the user-set name. Pre-fix this derived from s3_url which
+        // always ended in "rootfs.tar.zst" (every row showed the same name);
+        // the column was added + backfilled from cell PG sandbox_checkpoints
+        // so this now surfaces what customers actually called the checkpoint.
+        name: r.name && r.name.length > 0 ? r.name : r.id.slice(0, 8),
         status: "ready",
         sizeBytes: r.size_bytes ?? 0,
         activeForks: 0,
