@@ -488,12 +488,37 @@ func main() {
 				}
 				_ = store.UpdateSandboxSessionStatus(context.Background(), sandboxID, "hibernated", nil)
 			}
+			// Emit "hibernated" lifecycle event so events-ingest mirrors the
+			// status flip to D1 sandboxes_index. Without this, idle-timeout
+			// hibernations only land in cell PG and D1 keeps showing the
+			// sandbox as running on a worker that no longer hosts it.
+			if sandboxDBMgr != nil {
+				if sdb, dbErr := sandboxDBMgr.Get(sandboxID); dbErr == nil {
+					_ = sdb.LogEvent("hibernated", map[string]string{
+						"sandbox_id":     sandboxID,
+						"checkpoint_key": result.HibernationKey,
+						"reason":         "idle_timeout",
+					})
+				}
+				_ = sandboxDBMgr.Remove(sandboxID)
+			}
 		},
 		OnKill: func(sandboxID string) {
 			log.Printf("opensandbox-worker: sandbox %s killed on timeout", sandboxID)
 			execMgr.RemoveSessions(sandboxID)
 			if store != nil {
 				_ = store.UpdateSandboxSessionStatus(context.Background(), sandboxID, "stopped", nil)
+			}
+			// Same fix as OnHibernate above — D1 needs a "stopped" event so
+			// the dashboard doesn't keep the row at "running" forever.
+			if sandboxDBMgr != nil {
+				if sdb, dbErr := sandboxDBMgr.Get(sandboxID); dbErr == nil {
+					_ = sdb.LogEvent("stopped", map[string]string{
+						"sandbox_id": sandboxID,
+						"reason":     "kill_timeout",
+					})
+				}
+				_ = sandboxDBMgr.Remove(sandboxID)
 			}
 		},
 	})

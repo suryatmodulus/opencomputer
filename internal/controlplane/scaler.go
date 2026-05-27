@@ -2,7 +2,6 @@ package controlplane
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -187,40 +186,18 @@ func NewScaler(cfg ScalerConfig) *Scaler {
 	}
 }
 
-// publishMigrated XADDs a "migrated" event to events:{cell_id} so events-
-// ingest updates D1 sandboxes_index.worker_id. Required for rolling-replace
-// + evacuation paths — without it, the dashboard's cross-cell view drifts
-// from cell-PG truth on every scaler-driven migration. Best-effort; failures
-// are logged but don't block the migration itself.
+// publishMigrated XADDs a "migrated" event when a sandbox's worker_id moves
+// (rolling replace, evacuation). Without it, D1 drifts from cell PG.
 func (s *Scaler) publishMigrated(ctx context.Context, sandboxID, newWorkerID string, orgID uuid.UUID, reason string) {
-	if s.rdb == nil || s.cellID == "" || sandboxID == "" {
-		return
-	}
-	envelope := map[string]any{
-		"id":         uuid.NewString(),
-		"type":       "migrated",
-		"sandbox_id": sandboxID,
-		"org_id":     orgID.String(),
-		"worker_id":  newWorkerID,
-		"cell_id":    s.cellID,
-		"payload":    map[string]any{"reason": reason},
-		"timestamp":  time.Now().UTC().Format(time.RFC3339Nano),
-	}
-	body, err := json.Marshal(envelope)
-	if err != nil {
-		log.Printf("scaler: publishMigrated marshal: %v", err)
-		return
-	}
-	xaddCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	if err := s.rdb.XAdd(xaddCtx, &redis.XAddArgs{
-		Stream: "events:" + s.cellID,
-		MaxLen: 100000,
-		Approx: true,
-		Values: map[string]any{"event": string(body)},
-	}).Err(); err != nil {
-		log.Printf("scaler: publishMigrated XADD: %v", err)
-	}
+	PublishLifecycle(ctx, s.rdb, s.cellID, "migrated", sandboxID, newWorkerID, orgID, reason)
+}
+
+// publishStopped XADDs a "stopped" event when the CP determines a sandbox
+// can no longer be reached on its prior worker (orphan sweep). The
+// worker_id in the envelope is the dead one for trace continuity;
+// events-ingest sets status='stopped' on D1.
+func (s *Scaler) publishStopped(ctx context.Context, sandboxID, workerID string, orgID uuid.UUID, reason string) {
+	PublishLifecycle(ctx, s.rdb, s.cellID, "stopped", sandboxID, workerID, orgID, reason)
 }
 
 // Start begins the autoscaling loop. Can be called multiple times (idempotent).
@@ -1130,10 +1107,17 @@ func (s *Scaler) drainWorker(workerID, machineID, region string) {
 			// reflects reality before the worker gets destroyed.
 			if s.store != nil {
 				sweepCtx, sweepCancel := context.WithTimeout(context.Background(), 10*time.Second)
-				if n, err := s.store.MarkOrphanedOnWorker(sweepCtx, workerID, "drain completed; worker reported no sandboxes"); err != nil {
+				orphans, err := s.store.MarkOrphanedOnWorker(sweepCtx, workerID, "drain completed; worker reported no sandboxes")
+				if err != nil {
 					log.Printf("scaler: drain: orphan sweep on %s failed: %v", workerID, err)
-				} else if n > 0 {
-					log.Printf("scaler: drain: orphan sweep on %s reconciled %d phantom row(s)", workerID, n)
+				} else if len(orphans) > 0 {
+					log.Printf("scaler: drain: orphan sweep on %s reconciled %d phantom row(s)", workerID, len(orphans))
+					// Mirror the PG change to D1 via the events stream — without
+					// these XADDs, sandboxes_index stays at status='running'
+					// pointing at the about-to-be-destroyed worker forever.
+					for _, o := range orphans {
+						s.publishStopped(context.Background(), o.SandboxID, workerID, o.OrgID, "drain_orphan_sweep")
+					}
 				}
 				sweepCancel()
 			}

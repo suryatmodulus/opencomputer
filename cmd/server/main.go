@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+
 	"github.com/opensandbox/opensandbox/internal/api"
 	"github.com/opensandbox/opensandbox/internal/auth"
 	"github.com/opensandbox/opensandbox/internal/billing"
@@ -530,12 +532,21 @@ func main() {
 				for _, w := range redisRegistry.GetAllWorkers() {
 					liveWorkers[w.ID] = true
 				}
-				orphaned, err := opts.Store.MarkOrphanedSandboxes(ctx, liveWorkers)
+				orphans, err := opts.Store.MarkOrphanedSandboxes(ctx, liveWorkers)
 				if err != nil {
 					log.Printf("maintenance: orphan reconciliation error: %v", err)
 					observability.CaptureError(err, "area", "maintenance", "op", "mark_orphaned_sandboxes")
-				} else if orphaned > 0 {
-					log.Printf("maintenance: marked %d sandboxes as error (worker lost)", orphaned)
+				} else if len(orphans) > 0 {
+					log.Printf("maintenance: marked %d sandboxes as error (worker lost)", len(orphans))
+					// Mirror to D1 via the events stream. Without these XADDs,
+					// sandboxes_index keeps showing the rows as running on the
+					// dead worker indefinitely — the post-cutover ghost-row
+					// bug. Best-effort; the next tick will re-emit for any
+					// row still marked `error` on a dead worker if Redis
+					// rejected the first attempt.
+					if redisRegistry.RedisClient() != nil && cfg.CellID != "" {
+						publishStoppedFromMaintenance(ctx, redisRegistry.RedisClient(), cfg.CellID, orphans)
+					}
 				}
 			}
 		})
@@ -783,4 +794,14 @@ func getIntEnv(key string, def int) int {
 		log.Printf("opensandbox: invalid int in %s=%q, using default %d", key, v, def)
 	}
 	return def
+}
+
+// publishStoppedFromMaintenance emits a `stopped` lifecycle event per
+// orphaned sandbox so D1 sandboxes_index mirrors the PG sweep done by
+// MarkOrphanedSandboxes. Without these XADDs, the maintenance loop's
+// dead-worker cleanup is invisible to the dashboard.
+func publishStoppedFromMaintenance(ctx context.Context, rdb *redis.Client, cellID string, orphans []db.OrphanedSandbox) {
+	for _, o := range orphans {
+		controlplane.PublishLifecycle(ctx, rdb, cellID, "stopped", o.SandboxID, o.WorkerID, o.OrgID, "worker_lost")
+	}
 }
