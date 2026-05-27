@@ -22,12 +22,18 @@ asks about their own sandbox:
 - *"Did this sandbox actually need the memory I provisioned, or am I
   paying for headroom?"* — needs `memory_bytes` (cgroup `memory.current`)
 - *"When was the spike?"* — needs a time series
-- *"Show me memory and CPU over the last day"* — needs both, charted
+- *"Show me memory over the last day, charted"* — needs both shape
+  and data the current endpoint doesn't expose
 
-`memory_bytes` and `cpu_usec` are already collected every 60s in
-`sandbox_usage_samples` (migration 015, worker `usage_collector.go`).
-They have never been exposed via the API. The drilldown endpoint reads
-only from `sandbox_scale_events` and ignores the samples table entirely.
+`memory_bytes` is already collected every 60s in `sandbox_usage_samples`
+(migration 015, worker `usage_collector.go`). It has never been exposed
+via the API. The drilldown endpoint reads only from
+`sandbox_scale_events` and ignores the samples table entirely.
+
+**v1 is memory-only.** CPU mirrors the same shape and joins the same
+samples table but requires a collector fix first (see Out of scope).
+The API shape below is designed so the CPU fields slot in symmetrically
+when the collector lands — no breaking change at that point.
 
 This redesign closes that gap and replaces the response shape with one
 that serves programmatic consumers and dashboard charts from a single
@@ -48,8 +54,6 @@ GET /api/sandboxes/{id}/usage?from=<RFC3339>&to=<RFC3339>
   "totals": {
     "memoryAllocatedGbSeconds":  8000,
     "memoryUsedGbSeconds":       5400,
-    "cpuAllocatedCoreSeconds":   3600,
-    "cpuUsedCoreSeconds":         920,
     "uptimeSeconds":            86400,
     "memoryAllocatedPeakMb":     2048,
     "memoryUsedPeakMb":          1640
@@ -59,14 +63,10 @@ GET /api/sandboxes/{id}/usage?from=<RFC3339>&to=<RFC3339>
       "ts":                        "2026-05-22T00:00:00Z",
       "memoryAllocatedGbSeconds":      1.024,
       "memoryUsedGbSeconds":           0.612,
-      "cpuAllocatedCoreSeconds":       0.600,
-      "cpuUsedCoreSeconds":            0.180,
       "uptimeSeconds":                60,
       "allocatedMemoryMb":           1024,
       "usedMemoryMbAvg":              612,
-      "usedMemoryMbPeak":             720,
-      "allocatedCpuPct":              100,
-      "usedCpuPctAvg":                 18
+      "usedMemoryMbPeak":             720
     },
     { "ts": "2026-05-22T00:01:00Z", ... },
     ...
@@ -82,9 +82,8 @@ choice — for finer detail, ask for a shorter range.
 ### Why each point carries integrals *and* snapshots
 
 Each point includes both **time-integrated quantities** (`*GbSeconds`,
-`cpuUsedCoreSeconds`, `uptimeSeconds`) and **snapshot scalars**
-(`allocatedMemoryMb`, `usedMemoryMb{Avg,Peak}`, `allocatedCpuPct`,
-`usedCpuPctAvg`).
+`uptimeSeconds`) and **snapshot scalars** (`allocatedMemoryMb`,
+`usedMemoryMb{Avg,Peak}`).
 
 - Integrals are what compose. Sum point-level `memoryUsedGbSeconds`
   across any subrange and you get the integral over that subrange.
@@ -98,12 +97,12 @@ nothing and means clients never have to do
 
 ### Time-weighted average, not last-value
 
-`allocatedMemoryMb` and `allocatedCpuPct` inside each point are
-time-weighted averages over the bucket, not the value at the bucket's
-end. Reason: when a resize event falls inside a bucket, the average
-correctly attributes part of the bucket to the old tier and part to
-the new one. Last-value would lie about the bucket's interior, and
-charts would draw a clean step that doesn't match the GB-seconds math.
+`allocatedMemoryMb` inside each point is a time-weighted average over
+the bucket, not the value at the bucket's end. Reason: when a resize
+event falls inside a bucket, the average correctly attributes part of
+the bucket to the old tier and part to the new one. Last-value would
+lie about the bucket's interior, and charts would draw a clean step
+that doesn't match the GB-seconds math.
 
 The visual result: resize shows up as a single bucket with a
 fractional value, then the new tier from the next bucket on. Acceptable
@@ -197,10 +196,13 @@ question; this one serves the per-sandbox time-series question. Two
 endpoints, two natural shapes, no overlap.
 
 Additive change to consider in a follow-up (not part of this design):
-add `sort=-memoryUsedGbSeconds` and `sort=-cpuUsedCoreSeconds` on
-`/api/usage` so the upsell-signal leaderboard ("rank by *actual*
-usage, not by bill") is one query away. Requires reading the samples
-table in the aggregator query; reuses the same window/filter machinery.
+add `sort=-memoryUsedGbSeconds` on `/api/usage` so the upsell-signal
+leaderboard ("rank by *actual* usage, not by bill") is one query
+away. Requires reading the samples table in the aggregator query;
+reuses the same window/filter machinery. **This follow-up is what
+directly answers the "find heavy users" half of the original product
+ask** — the per-sandbox endpoint here answers the "look at one
+sandbox" half. Together they cover the surface.
 
 ## Backwards compatibility
 
@@ -229,15 +231,9 @@ scalars vs points + totals envelope). Path:
   `pids`. Indexed on `(org_id, sampled_at)` and primary-keyed on
   `(sandbox_id, sampled_at)`.
 
-**Required fix in `usage_collector.go`:**
-
-The collector currently writes `CPUUsec: 0` with a TODO comment (line
-103: `// TODO: parse from cgroup cpu.stat`). CPU usage is therefore
-not being recorded today, even though the column exists. The fix is to
-read `cpu.stat`'s `usage_usec` from each sandbox's cgroup and store
-the cumulative value; deltas between samples give per-minute CPU
-time consumed. Without this, `cpuUsedCoreSeconds` in the new endpoint
-returns 0 across the board — which is worse than dropping the field.
+**No collector changes required for v1.** Memory is already being
+collected end-to-end. CPU is deferred — see Out of scope for the
+collector TODO that has to be cleared before CPU joins the response.
 
 **Query shape:**
 
@@ -251,7 +247,6 @@ LEFT JOINed to the active scale event per minute, with everything
 COALESCEd to zero.
 
 `memoryUsedGbSeconds` per point = `memory_bytes / 1e9 * 60`.
-`cpuUsedCoreSeconds` per point = `(cpu_usec_curr - cpu_usec_prev) / 1e6`.
 `memoryAllocatedGbSeconds` per point = `memory_mb / 1024 * 60` (when
 running; 0 otherwise). `uptimeSeconds` = 60 if a sample exists for
 that minute, else 0.
@@ -279,8 +274,80 @@ average, peak well under the new tier. If they open the chart from
 `points[]`, the resize is a step in `allocatedMemoryMb` at the 6h
 mark, with the noisy `usedMemoryMbAvg` curve underneath.
 
+## Testing strategy
+
+**Handler / DB fixture tests** (`internal/api`, `internal/db`):
+
+- Generate-series query with seeded fixtures: given a known set of
+  `sandbox_scale_events` and `sandbox_usage_samples` rows, the
+  emitted `points[]` must match expectations field-by-field. The DB
+  seed is the input contract; the response is the output.
+- Time-weighted allocation across a resize: seed two scale events
+  whose boundary falls inside a 1m bucket, assert the bucket's
+  `allocatedMemoryMb` is the weighted average and the next bucket
+  shows the new tier.
+- Gap handling: a 5-minute window with samples only at minutes 1 and
+  4 produces 5 points; minutes 2, 3, 5 emit zero-points with no
+  nulls anywhere.
+- Window clamping: `from` predates the sandbox's first session →
+  leading minutes are zero-points, not missing rows.
+- Validation: `to <= from` → 400; `to - from > 30d` → 400; unknown
+  sandbox ID or one belonging to another org → 404 (existing
+  `ownsSandbox` check covers this).
+- Totals invariant: `SUM(points[].memoryUsedGbSeconds)` equals
+  `totals.memoryUsedGbSeconds` exactly (computed server-side from the
+  same materialized points, so this is testing the contract, not the
+  math).
+
+**Reconciliation against the existing billing query:**
+
+`totals.memoryAllocatedGbSeconds` should equal the existing
+`/api/usage`'s `memoryGbSeconds` for the same `[from, to]` and
+sandbox, since both derive from `sandbox_scale_events` with the
+same integration math. A reconciliation test catches accidental
+drift from the billing pipeline.
+
+**End-to-end on the GCP dev box:**
+
+The fastest validation loop is the existing dev host. Sample cadence
+is 60s, flush every 5 samples — so a meaningful response is available
+within ~3–5 minutes of starting a sandbox.
+
+1. Create a sandbox, run a workload that allocates ~600 MB (a Python
+   script holding a bytes buffer is enough).
+2. Wait for at least one flush (~5 min). Verify rows in
+   `sandbox_usage_samples` directly with `psql`.
+3. `GET /api/sandboxes/{id}/usage?from=<recent>&to=<now>` and inspect
+   the response: minute-resolution points, `usedMemoryMbAvg` tracks
+   the workload's RSS, `allocatedMemoryMb` matches the sandbox tier,
+   `uptimeSeconds: 60` per active minute.
+4. Resize the sandbox mid-experiment; verify the resize-bucket has a
+   fractional/weighted `allocatedMemoryMb` and subsequent buckets
+   show the new tier.
+5. Stop the sandbox; verify subsequent minutes inside the queried
+   window emit zero-points.
+
+This is the only path that exercises the full chain (worker
+collection → batch insert → query → response) and catches integration
+bugs that fixture tests miss (timezone handling, batch flush timing,
+sample-vs-scale-event ordering at boundaries).
+
+**SDK snapshot:**
+
+A snapshot test in each SDK against a recorded response from the dev
+box keeps the wire shape stable. Generated from a real response, not
+a hand-mocked fixture, so the test ages with the server's behavior.
+
 ## Out of scope for this design
 
+- **CPU utilization.** The schema, samples table, and API shape all
+  support it (mirror `memoryUsedGbSeconds` etc. with `cpuUsedCoreSeconds`,
+  `usedCpuPctAvg`, `allocatedCpuPct`). Blocked by `usage_collector.go:103`
+  — the collector writes `CPUUsec: 0` with a TODO to parse cgroup
+  `cpu.stat`. Follow-up: read `usage_usec` from each sandbox's
+  `cpu.stat`, store cumulative; deltas between samples give per-minute
+  CPU time consumed. Once samples carry real values, the API gains
+  the symmetric CPU fields with no shape change.
 - New `/api/usage` sort modes by actual usage. Mentioned as a natural
   follow-up; the leaderboard endpoint design is separate work.
 - A dashboard page. Falls out trivially from this endpoint, but the
