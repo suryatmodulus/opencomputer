@@ -19,6 +19,9 @@ Thumbs.db
 .env.*
 !.env.example
 
+# Per-developer dev-box lifecycle state (written by deploy/*/deploy-qemu-dev.sh)
+deploy/**/.qemu-dev-state-*
+
 # Python
 __pycache__/
 *.pyc
