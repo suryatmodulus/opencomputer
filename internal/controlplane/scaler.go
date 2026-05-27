@@ -1516,9 +1516,14 @@ func (s *Scaler) liveMigrateSandbox(ctx context.Context, sandboxID, sourceWorker
 				// Source VM is gone, target failed. Emit a `stopped` event so
 				// D1 reflects the unreachable state — otherwise the dashboard
 				// keeps showing the sandbox as running on the dead source.
+				// Log the org-id lookup miss so a uuid.Nil org_id on a
+				// `stopped` event is traceable to this exact spot rather
+				// than left as a mystery in the audit log.
 				var failOrgID uuid.UUID
 				if sess, err := s.store.GetSandboxSession(context.Background(), sandboxID); err == nil && sess != nil {
 					failOrgID = sess.OrgID
+				} else {
+					log.Printf("scaler: migrate %s: GetSandboxSession failed during failure-emit (%v) — `stopped` event will carry uuid.Nil org_id", sandboxID, err)
 				}
 				s.publishStopped(context.Background(), sandboxID, sourceWorkerID, failOrgID, "migration_post_qmp_failed")
 			} else {

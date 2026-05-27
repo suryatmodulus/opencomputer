@@ -1341,6 +1341,14 @@ func (s *Store) ReconcileWorkerSessions(ctx context.Context, workerID string) (h
 			hibernated = append(hibernated, o)
 		}
 	}
+	// Surface mid-iteration failures (conn drop, decode error). Without this,
+	// a truncated rows would yield a partial slice; the caller then emits
+	// events only for the rows it saw and the rest become D1 ghosts — exactly
+	// the bug this reconciler is meant to fix.
+	if rowsErr := hibernatedRows.Err(); rowsErr != nil {
+		hibernatedRows.Close()
+		return nil, nil, fmt.Errorf("iterating hibernated reconcile rows: %w", rowsErr)
+	}
 	hibernatedRows.Close()
 
 	// Second: mark remaining "running" sessions as "stopped"
@@ -1357,6 +1365,10 @@ func (s *Store) ReconcileWorkerSessions(ctx context.Context, workerID string) (h
 		if scanErr := stoppedRows.Scan(&o.SandboxID, &o.OrgID, &o.WorkerID); scanErr == nil {
 			stopped = append(stopped, o)
 		}
+	}
+	if rowsErr := stoppedRows.Err(); rowsErr != nil {
+		stoppedRows.Close()
+		return hibernated, nil, fmt.Errorf("iterating stopped reconcile rows: %w", rowsErr)
 	}
 	stoppedRows.Close()
 
@@ -1403,7 +1415,7 @@ func (s *Store) ReconcileWorkerReconnect(ctx context.Context, workerID string, r
 			fixed = append(fixed, o)
 		}
 	}
-	return fixed, nil
+	return fixed, rows.Err()
 }
 
 // UpsertWorkspaceBackup creates or updates a workspace-only backup record for a sandbox.
