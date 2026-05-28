@@ -115,4 +115,57 @@ describe("api-edge WebSocket auth", () => {
     expect(await resp.json()).toEqual({ error: "missing or invalid API key" });
     expect(fetchSpy).not.toHaveBeenCalled();
   });
+
+  it("strips api_key query params from proxied HTTP requests authenticated by header", async () => {
+    const fetchSpy = vi.fn(async (_url: string, _init?: RequestInit) => new Response("proxied", { status: 200 }));
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const resp = await worker.fetch(
+      new Request(
+        "https://app.opencomputer.dev/api/sandboxes/sb-123/exec?api_key=osb_query&stream=1",
+        {
+          headers: {
+            "X-API-Key": "osb_header",
+          },
+        },
+      ),
+      env,
+      ctx,
+    );
+
+    expect(resp.status).toBe(200);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    const forwardedURL = new URL(fetchSpy.mock.calls[0][0] as string);
+    expect(forwardedURL.origin).toBe("https://cp-us-east-2.opencomputer.dev");
+    expect(forwardedURL.pathname).toBe("/api/sandboxes/sb-123/exec");
+    expect(forwardedURL.searchParams.get("stream")).toBe("1");
+    expect(forwardedURL.searchParams.has("api_key")).toBe(false);
+
+    const forwardedHeaders = new Headers(fetchSpy.mock.calls[0][1]?.headers);
+    expect(forwardedHeaders.get("authorization")).toMatch(/^Bearer /);
+    expect(forwardedHeaders.get("x-api-key")).toBeNull();
+  });
+
+  it("rejects WebSocket proxy requests without header or query auth", async () => {
+    const fetchSpy = vi.fn(async (_req: Request) => new Response("proxied", { status: 200 }));
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const resp = await worker.fetch(
+      new Request(
+        "https://app.opencomputer.dev/api/sandboxes/sb-123/exec/es-123",
+        {
+          headers: {
+            Upgrade: "websocket",
+          },
+        },
+      ),
+      env,
+      ctx,
+    );
+
+    expect(resp.status).toBe(401);
+    expect(await resp.json()).toEqual({ error: "missing or invalid API key" });
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
 });

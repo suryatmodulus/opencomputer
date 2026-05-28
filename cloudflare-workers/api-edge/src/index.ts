@@ -115,7 +115,7 @@ function apiKeyFromRequest(req: Request): string | null {
   return null;
 }
 
-function stripEdgeAuthQueryParam(target: string): string {
+function stripApiKeyQueryParam(target: string): string {
   const url = new URL(target);
   url.searchParams.delete("api_key");
   return url.toString();
@@ -574,7 +574,7 @@ async function proxyToCellSDK(req: Request, env: Env, ctx: ExecutionContext, cal
   if (!cell) return json({ error: `cell ${row.cell_id} not registered` }, 503);
 
   const url = new URL(req.url);
-  const target = cell.base_url.replace(/\/$/, "") + url.pathname + url.search;
+  const target = stripApiKeyQueryParam(cell.base_url.replace(/\/$/, "") + url.pathname + url.search);
   // Look up the org's plan so the cap-token carries it (worker resolver uses
   // plan to tag usage_tick events; without it free-tier debit fan-out skips
   // the org).
@@ -637,7 +637,7 @@ async function proxyToCellSDK(req: Request, env: Env, ctx: ExecutionContext, cal
   // upgrades transparently when you pass a Request clone — same pattern
   // handlePreviewURL uses and that's verified to work end-to-end with WS.
   if (isWebSocketUpgrade(req)) {
-    const fwd = new Request(stripEdgeAuthQueryParam(target), req);
+    const fwd = new Request(target, req);
     fwd.headers.set("authorization", "Bearer " + token);
     fwd.headers.delete("x-api-key");
     return await fetch(fwd);
