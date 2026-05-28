@@ -3,9 +3,16 @@ title: 'Usage Aggregator'
 api: 'GET /api/usage'
 ---
 
-Aggregate GB-second spend grouped by sandbox or by tag. Dollars are
-not exposed — Stripe owns pricing, and this endpoint returns the same
-physical quantities the invoice is computed from.
+Aggregate spend grouped by sandbox or by tag. Dollars are not exposed
+— Stripe owns pricing, and this endpoint returns the same physical
+quantities the invoice is computed from.
+
+<Note>
+All `*GbSeconds` fields are **GiB-seconds** (binary, 2<sup>30</sup>
+bytes/GiB), not decimal GB. For a sandbox provisioned at 1024 MiB
+running for one second, `memoryGbSeconds` is 1. The wire name uses
+`Gb` for backwards compatibility.
+</Note>
 
 <Note>
 Freshness: accurate to the minute for cleanly-shutdown sandboxes.
@@ -13,6 +20,9 @@ A silently-dead worker leaves scale events open until the worker
 restarts; until then, accrual keeps going. This is the same behavior
 as the Stripe pipeline.
 </Note>
+
+For per-sandbox time-series drilldown (memory utilization over time,
+1-minute resolution), see [`GET /api/sandboxes/:id/usage`](/api-reference/usage/get-sandbox-usage).
 
 <ParamField query="groupBy" type="string" required>
   `sandbox` for top sandboxes, or `tag:<key>` for spend by tag value.
