@@ -6,8 +6,7 @@ description: "Inspect a sandbox's memory allocation and actual utilization over 
 Every sandbox emits resource samples while it runs. The platform
 exposes them as a per-minute time series plus envelope totals — so
 you can answer "is this sandbox actually using the memory I'm paying
-for?" or "show me memory pressure over the last hour" without
-running your own collector.
+for?" or "show me memory pressure over the last hour."
 
 The API surface is one endpoint: [`GET /api/sandboxes/:id/usage`](/api-reference/usage/get-sandbox-usage).
 A separate aggregator at [`GET /api/usage`](/api-reference/usage/get-usage)
@@ -46,14 +45,13 @@ The two memory metrics answer different questions, and the gap
 between them is usually where the interesting signal lives.
 
 - **`memoryAllocatedGbSeconds`** — what the sandbox's plan promised,
-  integrated over time. Comes from `sandbox_scale_events` and is
-  the same physical quantity the billing pipeline reports. If you
-  resized the sandbox mid-window, the points reflect the
-  time-weighted blend.
-- **`memoryUsedGbSeconds`** — what the qemu process's cgroup actually
-  reported as `memory.current`, sampled every 60s and integrated.
-  This is the "headroom" signal — if it's much lower than the
-  allocated number, you're over-provisioned.
+  integrated over time. This is the same physical quantity the bill
+  is computed from. If you resized the sandbox mid-window, the
+  points reflect the time-weighted blend.
+- **`memoryUsedGbSeconds`** — what the sandbox process actually
+  consumed, sampled every 60s and integrated. This is the headroom
+  signal — if it's much lower than the allocated number, you're
+  over-provisioned.
 
 Ratios are stable: both are in **GiB-seconds** (binary,
 2<sup>30</sup> bytes/GiB), so `used / allocated` gives you a clean
@@ -107,10 +105,11 @@ curl -s "$OC_API_URL/api/sandboxes/sb-abc/usage?from=2026-05-27T00:00:00Z&to=202
 - Minutes where the sandbox isn't running emit zero-points
   (`uptimeSeconds: 0`, all integrals `0`) rather than nulls — charts
   read continuous x-axes without phantom interpolation.
-- During collector outages (the worker dies or restarts), `uptimeSeconds`
-  still reads 60 because a scale event is open. `usedMemoryMbAvg` will
-  be 0 for those minutes — that's how you spot "we should have data
-  but don't" on a chart.
+- If a sampling gap appears (e.g., the platform missed a measurement
+  window), `uptimeSeconds` still reads 60 because the sandbox was
+  running, but `usedMemoryMbAvg` reads 0 for those minutes — visible
+  as a brief flat-zero stretch under an otherwise continuous
+  allocated line.
 - Window max is **30 days**. For longer-range questions, use the
   aggregator at `/api/usage` and sum across sandboxes there.
 
@@ -123,8 +122,3 @@ filter/sort/cursor and doesn't materialize point-level data — much
 cheaper at scale. The per-sandbox endpoint here is the drilldown
 after you've picked one to look at.
 
-<Note>
-v1 ships memory only. CPU mirrors the same shape (`cpuUsedCoreSeconds`,
-`usedCpuPctAvg`, etc.) once the worker collector starts populating
-cgroup `cpu.stat` — additive change, no shape break.
-</Note>

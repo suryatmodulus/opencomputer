@@ -4,15 +4,9 @@ api: 'GET /api/sandboxes/{id}/usage'
 ---
 
 Per-sandbox memory usage over a window, as 1-minute points plus
-envelope totals. Allocation is integrated from scale events (same
-math the billing pipeline uses); used memory is sampled every 60s
-from the qemu process's cgroup `memory.current`.
-
-<Note>
-v1 is memory only. CPU mirrors this shape (`cpuUsedCoreSeconds`,
-`usedCpuPctAvg`, etc.) once the worker collector starts populating
-cgroup `cpu.stat` — additive change, no shape break.
-</Note>
+envelope totals. Allocated memory is the tier the sandbox was
+provisioned at, integrated over time; used memory is the actual
+resident memory consumed by the sandbox process, sampled every 60s.
 
 <ParamField path="id" type="string" required>
   Sandbox ID.
@@ -67,11 +61,10 @@ cgroup `cpu.stat` — additive change, no shape break.
 ### Units
 
 All `*GbSeconds` fields are **GiB-seconds** (binary, 2<sup>30</sup>
-bytes/GiB). For a sandbox provisioned at 1024 MiB running for one
-minute, `memoryAllocatedGbSeconds` is `1024/1024 × 60 = 60`. For an
-RSS sample of 612 MiB, `memoryUsedGbSeconds` is `612/1024 × 60 ≈
-35.86`. The wire name uses `Gb` for backwards compatibility with the
-billing aggregator; do not interpret it as decimal GB.
+bytes/GiB), not decimal GB. For a sandbox provisioned at 1024 MiB
+running for one minute, `memoryAllocatedGbSeconds` is
+`1024/1024 × 60 = 60`. For a measured RSS of 612 MiB,
+`memoryUsedGbSeconds` is `612/1024 × 60 ≈ 35.86`.
 
 ### Reading the response
 
