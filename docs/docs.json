@@ -49,6 +49,7 @@
           {
             "group": "Usage",
             "tag": "Preview",
+            "expanded": true,
             "pages": [
               "sandboxes/usage"
             ]
@@ -133,6 +134,7 @@
           {
             "group": "Usage & Tags",
             "tag": "Preview",
+            "expanded": true,
             "pages": [
               "reference/typescript-sdk/usage"
             ]
