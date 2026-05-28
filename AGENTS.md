@@ -33,7 +33,7 @@ truth they come from.
   aren't enough
 - `internal/config/config.go` — environment variables and runtime config
 - `proto/` — inter-tier contracts
-- `docs/mint.json` — docs navigation
+- `docs/docs.json` — docs navigation
 - `cmd/oc/` — CLI entrypoint
 - `sdks/typescript/` and `sdks/python/` — published SDKs
 
@@ -182,7 +182,15 @@ just a refactor.
 - **SDKs and CLI are public surfaces.** Prefer preserving behavior over
   rearranging internals for neatness.
 - **Docs navigation is explicit.** Adding a page without wiring it into
-  `docs/mint.json` leaves it effectively invisible.
+  `docs/docs.json` leaves it effectively invisible.
+- **User-facing docs describe the product, not the implementation.**
+  Files under `docs/` are read by customers. Do not leak internal
+  context: roadmap labels ("v1", "follow-up"), schema names
+  (`sandbox_scale_events`, `cgroup memory.current`), build artifacts
+  (`worker`, `usage_collector`), or "for backwards compatibility"
+  rationale. Describe observable behavior in the user's vocabulary.
+  Internal context belongs in `.agents/design/*`, `.agents/work/*`,
+  commit messages, and code comments.
 
 ## CLI boundary
 

@@ -67,18 +67,49 @@ class UsageByTagResponse:
 
 
 @dataclass
+class SandboxUsagePoint:
+    """One 1-minute bucket of memory usage. Integrals (``*_gb_seconds``,
+    ``uptime_seconds``) compose by summation; snapshot scalars
+    (``allocated_memory_mb``, ``used_memory_mb_*``) are for charts.
+
+    v1 is memory only. CPU fields will appear once the server-side
+    collector starts populating cgroup cpu.stat.
+    """
+
+    ts: str
+    memory_allocated_gb_seconds: float
+    memory_used_gb_seconds: float
+    uptime_seconds: int
+    allocated_memory_mb: int
+    used_memory_mb_avg: int
+    used_memory_mb_peak: int
+
+
+@dataclass
+class SandboxUsageTotals:
+    """Envelope totals over ``[from_, to)``. Invariant: summing the
+    matching field across ``points`` reproduces the value here."""
+
+    memory_allocated_gb_seconds: float
+    memory_used_gb_seconds: float
+    uptime_seconds: int
+    memory_allocated_peak_mb: int
+    memory_used_peak_mb: int
+
+
+@dataclass
 class SandboxUsageResponse:
+    """Response for ``GET /sandboxes/:id/usage``. Default window is
+    last 1 hour; max 30 days (server returns 400 beyond that).
+    ``from_`` and ``to`` accept ISO dates (``YYYY-MM-DD``) or RFC3339
+    timestamps."""
+
     sandbox_id: str
     from_: str
     to: str
-    memory_gb_seconds: float
-    disk_overage_gb_seconds: float
-    tags: dict[str, str]
-    tags_last_updated_at: str | None
-    first_started_at: str | None
-    last_ended_at: str | None
+    totals: SandboxUsageTotals
+    points: list[SandboxUsagePoint]
     alias: str | None = None
-    status: str | None = None
 
 
 @dataclass
@@ -235,18 +266,31 @@ class Usage:
         resp = await self._client.get(f"/sandboxes/{sandbox_id}/usage", params=params)
         resp.raise_for_status()
         b = resp.json()
+        t = b.get("totals") or {}
         return SandboxUsageResponse(
             sandbox_id=b["sandboxId"],
             from_=b["from"],
             to=b["to"],
-            memory_gb_seconds=b["memoryGbSeconds"],
-            disk_overage_gb_seconds=b["diskOverageGbSeconds"],
-            tags=b.get("tags") or {},
-            tags_last_updated_at=b.get("tagsLastUpdatedAt"),
-            first_started_at=b.get("firstStartedAt"),
-            last_ended_at=b.get("lastEndedAt"),
+            totals=SandboxUsageTotals(
+                memory_allocated_gb_seconds=t.get("memoryAllocatedGbSeconds", 0.0),
+                memory_used_gb_seconds=t.get("memoryUsedGbSeconds", 0.0),
+                uptime_seconds=t.get("uptimeSeconds", 0),
+                memory_allocated_peak_mb=t.get("memoryAllocatedPeakMb", 0),
+                memory_used_peak_mb=t.get("memoryUsedPeakMb", 0),
+            ),
+            points=[
+                SandboxUsagePoint(
+                    ts=p["ts"],
+                    memory_allocated_gb_seconds=p["memoryAllocatedGbSeconds"],
+                    memory_used_gb_seconds=p["memoryUsedGbSeconds"],
+                    uptime_seconds=p["uptimeSeconds"],
+                    allocated_memory_mb=p["allocatedMemoryMb"],
+                    used_memory_mb_avg=p["usedMemoryMbAvg"],
+                    used_memory_mb_peak=p["usedMemoryMbPeak"],
+                )
+                for p in b.get("points") or []
+            ],
             alias=b.get("alias"),
-            status=b.get("status"),
         )
 
 

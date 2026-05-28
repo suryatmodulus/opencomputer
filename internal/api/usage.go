@@ -25,6 +25,22 @@ const (
 	usageHandlerTimeout = 10 * time.Second
 )
 
+// parseUsageTimestamp accepts either a full RFC3339 timestamp
+// (`2026-05-27T15:30:00Z`) or a bare ISO date (`2026-05-27`). Dates
+// are interpreted as UTC midnight — the conventional "start of day"
+// semantics for usage windows. Anything in between (date + time
+// without a timezone) is rejected because the interpretation isn't
+// obvious.
+func parseUsageTimestamp(s string) (time.Time, error) {
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t, nil
+	}
+	if t, err := time.Parse("2006-01-02", s); err == nil {
+		return t.UTC(), nil
+	}
+	return time.Time{}, fmt.Errorf("must be an ISO date (YYYY-MM-DD) or RFC3339 timestamp")
+}
+
 // parseUsageQuery reads from / to / groupBy / filter[...] / sort /
 // limit / cursor from the echo request. Returns a fully-validated
 // UsageQuery suitable for handing to the store.
@@ -38,18 +54,18 @@ func parseUsageQuery(c echo.Context) (db.UsageQuery, error) {
 
 	now := time.Now().UTC()
 	if s := c.QueryParam("from"); s != "" {
-		t, err := time.Parse(time.RFC3339, s)
+		t, err := parseUsageTimestamp(s)
 		if err != nil {
-			return q, fmt.Errorf("`from` must be RFC3339: %w", err)
+			return q, fmt.Errorf("`from` %w", err)
 		}
 		q.From = t
 	} else {
 		q.From = now.Add(-usageDefaultWindow)
 	}
 	if s := c.QueryParam("to"); s != "" {
-		t, err := time.Parse(time.RFC3339, s)
+		t, err := parseUsageTimestamp(s)
 		if err != nil {
-			return q, fmt.Errorf("`to` must be RFC3339: %w", err)
+			return q, fmt.Errorf("`to` %w", err)
 		}
 		q.To = t
 	} else {
@@ -288,84 +304,79 @@ func (s *Server) listTags(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]interface{}{"keys": keys})
 }
 
+// sandboxUsageDefaultWindow is the default lookback when callers omit
+// `from`/`to`. v1 of the new shape (per
+// .agents/design/per-sandbox-usage-api.md) treats the per-sandbox
+// endpoint as a "what's it doing now" surface, so the default is short.
+// Longer-range queries are deliberately a different tool — the
+// aggregator at /api/usage.
+const sandboxUsageDefaultWindow = time.Hour
+
 // getSandboxUsage → GET /api/sandboxes/:id/usage
+//
+// Returns 1-minute points + envelope totals for memory allocation and
+// utilization over [from, to). Window capped at 30 days (enforced in
+// db.SandboxUsagePoints). v1 is memory only; CPU joins symmetrically
+// once usage_collector.go starts populating cpu_usec.
 func (s *Server) getSandboxUsage(c echo.Context) error {
 	sandboxID := c.Param("id")
-	if err := s.ownsSandbox(c, sandboxID); err != nil {
+	if ok, err := s.ownsSandbox(c, sandboxID); err != nil || !ok {
 		return err
 	}
 
 	orgID, _ := auth.GetOrgID(c)
 
 	now := time.Now().UTC()
-	from, to := now.Add(-usageDefaultWindow), now
+	from, to := now.Add(-sandboxUsageDefaultWindow), now
 	if s := c.QueryParam("from"); s != "" {
-		t, err := time.Parse(time.RFC3339, s)
+		t, err := parseUsageTimestamp(s)
 		if err != nil {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "`from` must be RFC3339"})
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("`from` %s", err)})
 		}
 		from = t
 	}
 	if s := c.QueryParam("to"); s != "" {
-		t, err := time.Parse(time.RFC3339, s)
+		t, err := parseUsageTimestamp(s)
 		if err != nil {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "`to` must be RFC3339"})
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("`to` %s", err)})
 		}
 		to = t
-	}
-	if !to.After(from) {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "`to` must be after `from`"})
-	}
-	if to.Sub(from) > 90*24*time.Hour {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "query window must be <= 90 days"})
 	}
 
 	ctx, cancel := context.WithTimeout(c.Request().Context(), usageHandlerTimeout)
 	defer cancel()
 
-	mem, disk, firstStarted, lastEnded, err := s.store.SandboxUsageWindow(ctx, orgID, sandboxID, from, to)
+	points, totals, err := s.store.SandboxUsagePoints(ctx, orgID, sandboxID, from, to)
 	if err != nil {
+		// validateSandboxUsageWindow surfaces these strings; map to 400.
+		if msg := err.Error(); strings.Contains(msg, "must be after") ||
+			strings.Contains(msg, "query window must be") {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": msg})
+		}
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 	}
-
-	sess, _ := s.store.GetSandboxSessionInOrg(ctx, orgID, sandboxID)
-	tagSet, err := s.store.GetSandboxTags(ctx, orgID, sandboxID)
-	if err != nil {
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
-	}
-	if tagSet.Tags == nil {
-		tagSet.Tags = map[string]string{}
+	if points == nil {
+		// Guarantee a non-null `points` array in the response so SDK
+		// consumers don't have to special-case empty windows.
+		points = []db.UsagePoint{}
 	}
 
 	resp := map[string]interface{}{
-		"sandboxId":            sandboxID,
-		"from":                 from.UTC().Format(time.RFC3339),
-		"to":                   to.UTC().Format(time.RFC3339),
-		"memoryGbSeconds":      mem,
-		"diskOverageGbSeconds": disk,
-		"tags":                 tagSet.Tags,
+		"sandboxId": sandboxID,
+		"from":      from.UTC().Format(time.RFC3339),
+		"to":        to.UTC().Format(time.RFC3339),
+		"totals":    totals,
+		"points":    points,
 	}
-	if sess != nil {
-		resp["status"] = sess.Status
+
+	// Alias is cheap and useful for CLI/dashboard contexts; impl plan Q1
+	// recommended keeping it. Tags/status/etc. live on /api/sandboxes/:id.
+	if sess, err := s.store.GetSandboxSessionInOrg(ctx, orgID, sandboxID); err == nil && sess != nil {
 		if alias := aliasFromConfig(sess.Config); alias != "" {
 			resp["alias"] = alias
 		}
 	}
-	if tagSet.LastUpdatedAt != nil {
-		resp["tagsLastUpdatedAt"] = tagSet.LastUpdatedAt.UTC().Format(time.RFC3339)
-	} else {
-		resp["tagsLastUpdatedAt"] = nil
-	}
-	if firstStarted != nil {
-		resp["firstStartedAt"] = firstStarted.UTC().Format(time.RFC3339)
-	} else {
-		resp["firstStartedAt"] = nil
-	}
-	if lastEnded != nil {
-		resp["lastEndedAt"] = lastEnded.UTC().Format(time.RFC3339)
-	} else {
-		resp["lastEndedAt"] = nil
-	}
+
 	return c.JSON(http.StatusOK, resp)
 }
 

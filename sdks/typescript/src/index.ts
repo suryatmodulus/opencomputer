@@ -31,6 +31,8 @@ export {
   type UsageQueryOpts,
   type UsageFilterMap,
   type SandboxUsageResponse,
+  type SandboxUsagePoint,
+  type SandboxUsageTotals,
   type TagKeyInfo,
 } from "./usage.js";
 // Node.js-only modules (use crypto, fs, path) — import via "@opencomputer/sdk/node".

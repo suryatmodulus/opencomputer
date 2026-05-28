@@ -12,10 +12,11 @@ import (
 	"github.com/opensandbox/opensandbox/internal/auth"
 )
 
-// Sandbox tag endpoints. All ownership checks read sandbox_sessions —
-// the sandbox_tags PK is (sandbox_id, key) without org_id, so the
-// handler is the enforcement point that prevents cross-tenant tag
-// writes. Never bypass that lookup.
+// Sandbox tag endpoints. Tag rows are keyed on (org_id, sandbox_id, key)
+// — see migration 026 — so storage is org-scoped on its own. Handlers
+// still run ownsSandbox before reads/writes so a caller can't probe
+// the existence of another org's sandbox via this surface, but the
+// table itself is the tenancy boundary.
 
 const (
 	maxTagsPerSandbox = 50
@@ -51,27 +52,28 @@ func validateTags(tags map[string]string) error {
 	return nil
 }
 
-// ownsSandbox returns nil when the caller's org has a session for the
-// given sandbox ID, otherwise returns a 404 response. Uses the
+// ownsSandbox returns true when the caller's org has a session for the
+// given sandbox ID, otherwise writes the appropriate error response and
+// returns false. Uses the
 // org-scoped session lookup (design F12) — querying by sandbox_id
 // alone could return another org's row on an ID collision, which
 // would cause the rightful owner to be denied access to their own
 // sandbox. 404 in both "doesn't exist" and "not your org" paths so
 // we don't leak cross-tenant existence.
-func (s *Server) ownsSandbox(c echo.Context, sandboxID string) error {
+func (s *Server) ownsSandbox(c echo.Context, sandboxID string) (bool, error) {
 	if s.store == nil {
-		return c.JSON(http.StatusServiceUnavailable, map[string]string{
+		return false, c.JSON(http.StatusServiceUnavailable, map[string]string{
 			"error": "database not configured",
 		})
 	}
 	orgID, ok := auth.GetOrgID(c)
 	if !ok {
-		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "org context required"})
+		return false, c.JSON(http.StatusUnauthorized, map[string]string{"error": "org context required"})
 	}
 	if _, err := s.store.GetSandboxSessionInOrg(c.Request().Context(), orgID, sandboxID); err != nil {
-		return c.JSON(http.StatusNotFound, map[string]string{"error": "sandbox not found"})
+		return false, c.JSON(http.StatusNotFound, map[string]string{"error": "sandbox not found"})
 	}
-	return nil
+	return true, nil
 }
 
 type tagsResponse struct {
@@ -89,7 +91,7 @@ func tagsResponseFromSet(tags map[string]string, lastUpdated *string) tagsRespon
 // getSandboxTags → GET /api/sandboxes/:id/tags
 func (s *Server) getSandboxTags(c echo.Context) error {
 	sandboxID := c.Param("id")
-	if err := s.ownsSandbox(c, sandboxID); err != nil {
+	if ok, err := s.ownsSandbox(c, sandboxID); err != nil || !ok {
 		return err
 	}
 	orgID, _ := auth.GetOrgID(c)
@@ -108,7 +110,7 @@ func (s *Server) getSandboxTags(c echo.Context) error {
 // putSandboxTags → PUT /api/sandboxes/:id/tags — full replace.
 func (s *Server) putSandboxTags(c echo.Context) error {
 	sandboxID := c.Param("id")
-	if err := s.ownsSandbox(c, sandboxID); err != nil {
+	if ok, err := s.ownsSandbox(c, sandboxID); err != nil || !ok {
 		return err
 	}
 
