@@ -132,3 +132,54 @@ The edge Worker and Go control plane should keep WebSocket auth behavior aligned
 as a public API contract. Any future WebSocket route added to the SDK should get
 an edge-level test for query-param auth, plus a negative HTTP test so query
 auth does not quietly expand across the whole API.
+
+## Design Concern: API Keys In WebSocket URLs
+
+The hotfix intentionally preserves the current public contract, but the contract
+itself is not ideal: long-lived API keys in URL query parameters are easier to
+leak than credentials in headers.
+
+Common leak paths:
+
+- HTTP access logs at proxies, CDNs, tunnels, or app servers.
+- Browser and SDK error messages that include the failed WebSocket URL.
+- Copy-pasted repro commands, screenshots, support tickets, and telemetry.
+- Referrer-like propagation in unusual browser/tooling contexts.
+
+The reason this exists is pragmatic, not because it is the best security shape:
+browser WebSocket clients cannot set arbitrary `X-API-Key` or `Authorization`
+headers. Node/Bun clients can often send headers depending on the WebSocket
+library, but the public SDK needs a browser-compatible path.
+
+Short-term stance:
+
+- Keep accepting `?api_key=` for WebSocket Upgrade requests for compatibility.
+- Keep it narrowly scoped to Upgrade requests only.
+- Strip it at the edge before proxying to the cell.
+- Redact credentials from SDK WebSocket error messages.
+
+Longer-term proposal:
+
+1. SDK makes a normal HTTPS request with `X-API-Key` to create or authorize an
+   attach operation.
+2. API returns a short-lived, scoped attach token or attach URL.
+3. SDK opens the WebSocket with `?token=<short-lived-token>`, not the long-lived
+   API key.
+
+The token should be scoped at least to:
+
+- org ID
+- sandbox ID
+- exec/PTY/agent session ID
+- operation, for example `exec_attach`
+
+Recommended properties:
+
+- 30-120 second TTL.
+- Signed by the control plane or edge.
+- Optionally one-time-use if the storage path is cheap enough.
+- No broad API capability if replayed.
+
+This keeps browser compatibility while reducing the blast radius of URL leaks.
+It also matches the existing direct-worker model, where SDKs already prefer a
+sandbox-scoped `?token=` when available.
