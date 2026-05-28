@@ -1,22 +1,29 @@
 ---
-title: 'Sandbox Usage Drilldown'
+title: 'Sandbox Usage'
 api: 'GET /api/sandboxes/{id}/usage'
 ---
 
-Per-sandbox GB-second spend over a window, plus tag set and
-lifetime bounds. Works for torn-down sandboxes — scale events and
-tags persist.
+Per-sandbox memory usage over a window, as 1-minute points plus
+envelope totals. Allocation is integrated from scale events (same
+math the billing pipeline uses); used memory is sampled every 60s
+from the qemu process's cgroup `memory.current`.
+
+<Note>
+v1 is memory only. CPU mirrors this shape (`cpuUsedCoreSeconds`,
+`usedCpuPctAvg`, etc.) once the worker collector starts populating
+cgroup `cpu.stat` — additive change, no shape break.
+</Note>
 
 <ParamField path="id" type="string" required>
   Sandbox ID.
 </ParamField>
 
 <ParamField query="from" type="string">
-  ISO-8601 lower bound. Default: now minus 30 days.
+  RFC3339 lower bound. Default: now minus 1 hour.
 </ParamField>
 
 <ParamField query="to" type="string">
-  ISO-8601 upper bound. Default: now. Window must be ≤ 90 days.
+  RFC3339 upper bound. Default: now. Window must be ≤ 30 days.
 </ParamField>
 
 <ResponseExample>
@@ -24,19 +31,67 @@ tags persist.
 {
   "sandboxId": "sb-abc",
   "alias": "my-agent",
-  "status": "running",
-  "from": "2026-03-23T00:00:00Z",
-  "to":   "2026-04-22T00:00:00Z",
-  "memoryGbSeconds":      12345.6,
-  "diskOverageGbSeconds":   789.0,
-  "tags":                 { "env": "prod", "team": "payments" },
-  "tagsLastUpdatedAt":    "2026-04-19T14:02:00Z",
-  "firstStartedAt":       "2026-03-25T09:13:02Z",
-  "lastEndedAt":          null
+  "from":   "2026-05-27T00:00:00Z",
+  "to":     "2026-05-28T00:00:00Z",
+  "totals": {
+    "memoryAllocatedGbSeconds":  8000,
+    "memoryUsedGbSeconds":       5400,
+    "uptimeSeconds":            86400,
+    "memoryAllocatedPeakMb":     2048,
+    "memoryUsedPeakMb":          1640
+  },
+  "points": [
+    {
+      "ts":                        "2026-05-27T00:00:00Z",
+      "memoryAllocatedGbSeconds":      1.024,
+      "memoryUsedGbSeconds":           0.612,
+      "uptimeSeconds":                60,
+      "allocatedMemoryMb":           1024,
+      "usedMemoryMbAvg":              612,
+      "usedMemoryMbPeak":             720
+    },
+    {
+      "ts":                        "2026-05-27T00:01:00Z",
+      "memoryAllocatedGbSeconds":      1.024,
+      "memoryUsedGbSeconds":           0.683,
+      "uptimeSeconds":                60,
+      "allocatedMemoryMb":           1024,
+      "usedMemoryMbAvg":              683,
+      "usedMemoryMbPeak":             742
+    }
+  ]
 }
 ```
 </ResponseExample>
 
-`firstStartedAt` / `lastEndedAt` come from session records clamped to
-the query window. `lastEndedAt` is `null` while any session for this
-sandbox is open.
+### Reading the response
+
+`totals.memoryAllocatedGbSeconds` is what the bill is computed from —
+the same physical quantity the Stripe pipeline reports. `totals.memoryUsedGbSeconds`
+is the integrated actual RSS; the ratio between the two tells you
+whether the sandbox is over-provisioned.
+
+Each point's `memoryAllocatedGbSeconds` and `memoryUsedGbSeconds`
+integrate over that 1-minute bucket — summing them across any
+subrange reconstructs the integral for that subrange. `totals.*` is
+the server-side sum across all returned points. Snapshot scalars
+(`allocatedMemoryMb`, `usedMemoryMb{Avg,Peak}`) are time-weighted
+averages over the bucket and are intended for chart rendering.
+
+### Bucket semantics
+
+- Buckets are minute-aligned in UTC, not aligned to `from`. The first
+  and last buckets may be partial if `from` / `to` are mid-minute.
+- Minutes where the sandbox is not running emit zero-points
+  (`uptimeSeconds: 0`, all integrals `0`) rather than nulls — gaps
+  read as continuous flat zero on a chart.
+- When a sandbox is resized mid-bucket, `allocatedMemoryMb` shows the
+  time-weighted average across the bucket; subsequent buckets reflect
+  the new tier.
+
+### Use the aggregator for cross-sandbox questions
+
+To rank sandboxes by spend (or, soon, by actual usage), use
+[`GET /api/usage`](/api-reference/usage/get-usage) — that endpoint
+serves cross-sandbox aggregates and supports filter/sort/cursor. The
+per-sandbox endpoint here is for "look at this one sandbox in detail."

@@ -69,18 +69,50 @@ export interface UsageQueryOpts {
   cursor?: string;
 }
 
+/**
+ * One 1-minute bucket of memory usage for a sandbox. Integrals
+ * (`*GbSeconds`, `uptimeSeconds`) compose by summation; snapshot scalars
+ * (`allocatedMemoryMb`, `usedMemoryMb*`) are for chart rendering.
+ *
+ * v1 is memory only. CPU fields will be added symmetrically once the
+ * server-side collector starts populating cgroup cpu.stat.
+ */
+export interface SandboxUsagePoint {
+  ts: string; // RFC3339, bucket start, minute-aligned in UTC
+  memoryAllocatedGbSeconds: number;
+  memoryUsedGbSeconds: number;
+  uptimeSeconds: number;
+  allocatedMemoryMb: number;
+  usedMemoryMbAvg: number;
+  usedMemoryMbPeak: number;
+}
+
+/**
+ * Envelope totals over `[from, to)`. Server-side invariant: summing
+ * the matching field across `points[]` reproduces the value here.
+ */
+export interface SandboxUsageTotals {
+  memoryAllocatedGbSeconds: number;
+  memoryUsedGbSeconds: number;
+  uptimeSeconds: number;
+  memoryAllocatedPeakMb: number;
+  memoryUsedPeakMb: number;
+}
+
+/**
+ * Response shape for `GET /api/sandboxes/:id/usage`. Default window is
+ * last 1 hour; max window is 30 days (server returns 400 beyond that).
+ * Allocation comes from scale events; used memory from cgroup samples.
+ *
+ * Charts read `points[]`; programmatic consumers usually want `totals`.
+ */
 export interface SandboxUsageResponse {
   sandboxId: string;
   alias?: string;
-  status?: string;
   from: string;
   to: string;
-  memoryGbSeconds: number;
-  diskOverageGbSeconds: number;
-  tags: Record<string, string>;
-  tagsLastUpdatedAt: string | null;
-  firstStartedAt: string | null;
-  lastEndedAt: string | null;
+  totals: SandboxUsageTotals;
+  points: SandboxUsagePoint[];
 }
 
 export interface TagKeyInfo {
