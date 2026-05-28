@@ -110,8 +110,15 @@ because resize is rare relative to the 1m bucket.
 
 ## Window
 
-Required: `from`, `to`. Both RFC3339. Default: last 1 hour. Max:
-**30 days**. `to` must be strictly greater than `from`.
+Optional: `from`, `to`. Both RFC3339. When omitted, server defaults
+to `from = now - 1h`, `to = now`. Max: **30 days**. `to` must be
+strictly greater than `from`.
+
+Boundary buckets are clamped to the original window — when `from`
+falls mid-minute, the first bucket's allocation and uptime reflect
+only the portion that actually overlaps `[from, to)`, not the full
+minute it nominally covers. Without this clamp, a default
+`now-1h..now` call would over-report by up to two full minutes.
 
 At 1m granularity, 30 days = 43,200 points ≈ 5 MB uncompressed JSON,
 ~300–500 KB gzipped. Trivial for browsers and SDK consumers. The
@@ -175,11 +182,16 @@ tag/lifetime hydration:
   utilization. It stays on `/api/usage` where billing consumers
   already read it. Disk is provisioned, not measured continuously —
   there is no `memory_bytes` analogue to surface.
-- **`tags`, `tagsLastUpdatedAt`, `status`, `alias`**: these are
-  identity, not usage. They belong on the sandbox detail endpoint
+- **`tags`, `tagsLastUpdatedAt`, `status`**: these are identity, not
+  usage. They belong on the sandbox detail endpoint
   (`GET /api/sandboxes/:id`), which already returns them. Bundling
   them here forces every usage call to re-hydrate metadata that
   doesn't change in a usage-relevant way.
+- **`alias`**: dropped from the strict-narrowing rationale above but
+  kept inline as an exception — it's a 2-line lookup from the
+  sandbox_sessions config JSONB, and CLI/dashboard contexts
+  ("which sandbox am I looking at?") read much better with it
+  present than with a follow-up call to `GET /api/sandboxes/:id`.
 - **`firstStartedAt`, `lastEndedAt`**: derivable from the points
   array (first/last point with `uptimeSeconds > 0`). The aggregate
   fields go away; the data they represented is still recoverable.
@@ -299,13 +311,33 @@ mark, with the noisy `usedMemoryMbAvg` curve underneath.
   same materialized points, so this is testing the contract, not the
   math).
 
-**Reconciliation against the existing billing query:**
+**Reconciliation against the existing billing query — and one
+intentional divergence:**
 
-`totals.memoryAllocatedGbSeconds` should equal the existing
-`/api/usage`'s `memoryGbSeconds` for the same `[from, to]` and
-sandbox, since both derive from `sandbox_scale_events` with the
-same integration math. A reconciliation test catches accidental
-drift from the billing pipeline.
+`totals.memoryAllocatedGbSeconds` equals the existing `/api/usage`'s
+`memoryGbSeconds` for the same `[from, to]` and sandbox **when all
+in-window scale events terminate at or before `to`**. Both derive from
+`sandbox_scale_events` with the same integration math (and the same
+`COALESCE(ended_at, LEAST(now(), to))` clamp for open events), so the
+common case is bug-for-bug identical and the Stripe pipeline keeps
+its reconciliation invariant.
+
+The two endpoints **disagree by design when an event's `ended_at > to`**.
+The existing aggregator does not clamp `ended_at` to `to` (an inherited
+quirk in `GetOrgUsage` documented at `internal/db/usage_query.go`);
+overflow time accrues into the "in-window" total. The new endpoint
+clamps via the bucket-edge `LEAST(..., $4)` chain, so it reports the
+mathematically correct in-window allocation while the aggregator
+overshoots.
+
+This divergence is pinned by `TestSandboxUsagePoints_OvershootDivergence_pgfixture`
+so it can't drift silently. The two endpoints will converge again when
+the aggregator's clamp is fixed (out of scope here).
+
+**Units note:** every `GbSeconds` field is **GiB-seconds** (binary,
+1 GiB = 2³⁰ bytes). The wire-format keeps the historical `Gb` name to
+stay compatible with the existing aggregator field; do not interpret
+it as decimal GB.
 
 **End-to-end on the GCP dev box:**
 

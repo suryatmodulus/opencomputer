@@ -19,21 +19,23 @@ func TestBuildSandboxUsagePointsQuery_Shape(t *testing.T) {
 	sql, args := buildSandboxUsagePointsQuery(uuid.New(), "sbx-1", from, to)
 
 	checks := map[string]string{
-		"minute-bucket generate_series":      "generate_series(",
-		"date_trunc minute alignment":        "date_trunc('minute',",
-		"sub-microsecond upper bound":        "$4::timestamptz - interval '1 microsecond'",
-		"samples CTE filter on org":          "WHERE org_id = $1",
-		"samples CTE filter on sandbox":      "AND sandbox_id = $2",
-		"samples CTE bucket grouping":        "GROUP BY date_trunc('minute', sampled_at)",
-		"scale-event overlap (LEAST clamp)":  "LEAST(COALESCE(e.ended_at, $4::timestamptz), b.ts_end)",
-		"scale-event overlap (GREATEST)":     "GREATEST(e.started_at, b.ts)",
-		"scale-event filter org-scoped":      "e.org_id    = $1",
-		"scale-event filter sandbox-scoped":  "e.sandbox_id = $2",
-		"weighted memory_mb computation":     "weighted_memory_mb",
-		"gb-seconds integration":             "memory_mb::float / 1024.0",
-		"used GB-seconds from memory_bytes":  "memory_bytes_avg::float / 1e9 * 60",
-		"uptime emitted as 60 or 0":          "CASE WHEN s.bucket_ts IS NOT NULL THEN 60 ELSE 0 END",
-		"ordered by bucket timestamp":        "ORDER BY b.ts",
+		"minute-bucket generate_series":       "generate_series(",
+		"date_trunc minute alignment":         "date_trunc('minute',",
+		"sub-microsecond upper bound":         "$4::timestamptz - interval '1 microsecond'",
+		"samples CTE filter on org":           "WHERE org_id = $1",
+		"samples CTE filter on sandbox":       "AND sandbox_id = $2",
+		"samples CTE bucket grouping":         "GROUP BY date_trunc('minute', sampled_at)",
+		"open-event clamp matches aggregator": "COALESCE(e.ended_at, LEAST(now(), $4::timestamptz))",
+		"upper-bound window clamp":            "b.ts_end, $4::timestamptz",
+		"lower-bound window clamp":            "GREATEST(e.started_at, b.ts, $3::timestamptz)",
+		"negative-overlap guard":              "GREATEST(EXTRACT(EPOCH FROM (",
+		"scale-event filter org-scoped":       "e.org_id    = $1",
+		"scale-event filter sandbox-scoped":   "e.sandbox_id = $2",
+		"weighted memory_mb computation":      "weighted_memory_mb",
+		"gb-seconds integration":              "memory_mb::float / 1024.0",
+		"used GiB-seconds from memory_bytes":  "memory_bytes_avg::float / 1073741824.0",
+		"uptime derived from overlap":         "a.uptime_seconds",
+		"ordered by bucket timestamp":         "ORDER BY b.ts",
 	}
 	for label, frag := range checks {
 		if !strings.Contains(sql, frag) {

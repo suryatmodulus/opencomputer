@@ -12,10 +12,11 @@ import (
 	"github.com/opensandbox/opensandbox/internal/auth"
 )
 
-// Sandbox tag endpoints. All ownership checks read sandbox_sessions —
-// the sandbox_tags PK is (sandbox_id, key) without org_id, so the
-// handler is the enforcement point that prevents cross-tenant tag
-// writes. Never bypass that lookup.
+// Sandbox tag endpoints. Tag rows are keyed on (org_id, sandbox_id, key)
+// — see migration 026 — so storage is org-scoped on its own. Handlers
+// still run ownsSandbox before reads/writes so a caller can't probe
+// the existence of another org's sandbox via this surface, but the
+// table itself is the tenancy boundary.
 
 const (
 	maxTagsPerSandbox = 50

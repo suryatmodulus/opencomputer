@@ -34,35 +34,44 @@ cgroup `cpu.stat` — additive change, no shape break.
   "from":   "2026-05-27T00:00:00Z",
   "to":     "2026-05-28T00:00:00Z",
   "totals": {
-    "memoryAllocatedGbSeconds":  8000,
-    "memoryUsedGbSeconds":       5400,
-    "uptimeSeconds":            86400,
-    "memoryAllocatedPeakMb":     2048,
-    "memoryUsedPeakMb":          1640
+    "memoryAllocatedGbSeconds":  86400,
+    "memoryUsedGbSeconds":       51640,
+    "uptimeSeconds":             86400,
+    "memoryAllocatedPeakMb":      1024,
+    "memoryUsedPeakMb":            742
   },
   "points": [
     {
-      "ts":                        "2026-05-27T00:00:00Z",
-      "memoryAllocatedGbSeconds":      1.024,
-      "memoryUsedGbSeconds":           0.612,
-      "uptimeSeconds":                60,
-      "allocatedMemoryMb":           1024,
-      "usedMemoryMbAvg":              612,
-      "usedMemoryMbPeak":             720
+      "ts":                          "2026-05-27T00:00:00Z",
+      "memoryAllocatedGbSeconds":         60.0,
+      "memoryUsedGbSeconds":              35.86,
+      "uptimeSeconds":                     60,
+      "allocatedMemoryMb":               1024,
+      "usedMemoryMbAvg":                  612,
+      "usedMemoryMbPeak":                 720
     },
     {
-      "ts":                        "2026-05-27T00:01:00Z",
-      "memoryAllocatedGbSeconds":      1.024,
-      "memoryUsedGbSeconds":           0.683,
-      "uptimeSeconds":                60,
-      "allocatedMemoryMb":           1024,
-      "usedMemoryMbAvg":              683,
-      "usedMemoryMbPeak":             742
+      "ts":                          "2026-05-27T00:01:00Z",
+      "memoryAllocatedGbSeconds":         60.0,
+      "memoryUsedGbSeconds":              40.02,
+      "uptimeSeconds":                     60,
+      "allocatedMemoryMb":               1024,
+      "usedMemoryMbAvg":                  683,
+      "usedMemoryMbPeak":                 742
     }
   ]
 }
 ```
 </ResponseExample>
+
+### Units
+
+All `*GbSeconds` fields are **GiB-seconds** (binary, 2<sup>30</sup>
+bytes/GiB). For a sandbox provisioned at 1024 MiB running for one
+minute, `memoryAllocatedGbSeconds` is `1024/1024 × 60 = 60`. For an
+RSS sample of 612 MiB, `memoryUsedGbSeconds` is `612/1024 × 60 ≈
+35.86`. The wire name uses `Gb` for backwards compatibility with the
+billing aggregator; do not interpret it as decimal GB.
 
 ### Reading the response
 

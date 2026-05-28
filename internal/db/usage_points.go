@@ -55,21 +55,36 @@ type SandboxUsageTotals struct {
 // SandboxUsagePoints so pure-Go tests can assert shape without a
 // Postgres connection. Inputs are validated; callers pass already-
 // validated [from, to).
+//
+// Units note: every GbSeconds field is GiB-seconds (binary, 2^30
+// bytes/GiB). `memory_mb` is treated as MiB (`/1024.0 → GiB`) to
+// match the billing pipeline; `memory_bytes` is divided by 1073741824
+// for the same unit. Mixing decimal GB with binary GiB would silently
+// bias the allocated-vs-used ratio.
 func buildSandboxUsagePointsQuery(orgID uuid.UUID, sandboxID string, from, to time.Time) (string, []any) {
 	args := []any{orgID, sandboxID, from, to}
 	// $1 = orgID, $2 = sandboxID, $3 = from, $4 = to.
 	//
-	// Bucket grid: minute-aligned in UTC. The last bucket is the one
-	// whose start time is strictly less than `to`, found via
-	// date_trunc('minute', $4 - 1us). Boundary buckets may be partial
-	// (sample filter is [from, to); allocation overlap is per-bucket
-	// without further clamping). This is the trade-off documented in
-	// Q2 of the impl plan.
+	// Bucket grid: minute-aligned in UTC. First bucket starts at
+	// date_trunc('minute', from) — may be earlier than `from` itself
+	// when `from` is mid-minute. Last bucket is the one whose start is
+	// strictly less than `to`. Per-event overlap is clamped to [$3, $4]
+	// as well as to bucket edges, so boundary buckets report only the
+	// fraction that overlaps the original window — the contract is
+	// [from, to), not "the union of minutes touching [from, to)".
 	//
-	// Allocation: time-weighted via SUM(memory_mb * overlap_seconds).
-	// The overlap expression mirrors GetOrgUsage's clamp idiom so the
-	// reconciliation invariant (Σ points.MemoryAllocatedGbSeconds ==
-	// GetOrgUsage allocated total) holds without bespoke math.
+	// Allocation source is sandbox_scale_events (same table the billing
+	// aggregator reads). Open events (ended_at IS NULL) are clamped to
+	// LEAST(now(), $4) to match GetOrgUsage's COALESCE idiom — so the
+	// two endpoints agree exactly when ended_at IS NULL. They diverge
+	// when ended_at > to: the aggregator overshoots (inherited quirk;
+	// see internal/db/usage_query.go:durationExpr), the new endpoint
+	// clamps to $4. This divergence is intentional and tested.
+	//
+	// Uptime per bucket = SUM(overlap_seconds) across joined events.
+	// This makes uptime track "was a scale event open" rather than
+	// "did we receive a sample," so collector outages don't masquerade
+	// as downtime in the response.
 	//
 	// Used memory: AVG/MAX over samples that fall in the bucket. At
 	// the 60s collector cadence there is usually one sample per
@@ -97,39 +112,45 @@ samples AS (
     AND sampled_at <  $4
   GROUP BY date_trunc('minute', sampled_at)
 ),
-allocated AS (
+event_overlap AS (
+  -- Named event_overlap because OVERLAPS is a Postgres reserved word
+  -- (temporal predicate). INNER JOIN (not LEFT) so buckets with no
+  -- matching scale event produce no rows -- the outer LEFT JOIN to
+  -- the allocated CTE then COALESCEs missing buckets to zero. A LEFT
+  -- JOIN here would let phantom NULL-event rows sneak through the
+  -- GREATEST(NULL, b.ts, $3) idiom and emit a full-bucket
+  -- overlap_seconds for buckets that should have no allocation.
   SELECT
     b.ts AS bucket_ts,
-    SUM(
-      e.memory_mb::float
-      * EXTRACT(EPOCH FROM (
-          LEAST(COALESCE(e.ended_at, $4::timestamptz), b.ts_end)
-          - GREATEST(e.started_at, b.ts)
-        ))
-    ) / 60.0 AS weighted_memory_mb,
-    SUM(
-      e.memory_mb::float / 1024.0
-      * EXTRACT(EPOCH FROM (
-          LEAST(COALESCE(e.ended_at, $4::timestamptz), b.ts_end)
-          - GREATEST(e.started_at, b.ts)
-        ))
-    ) AS gb_seconds
+    e.memory_mb,
+    GREATEST(EXTRACT(EPOCH FROM (
+      LEAST(COALESCE(e.ended_at, LEAST(now(), $4::timestamptz)), b.ts_end, $4::timestamptz)
+      - GREATEST(e.started_at, b.ts, $3::timestamptz)
+    )), 0) AS overlap_seconds
   FROM buckets b
-  LEFT JOIN sandbox_scale_events e
+  INNER JOIN sandbox_scale_events e
     ON e.org_id    = $1
    AND e.sandbox_id = $2
    AND e.started_at < b.ts_end
    AND (e.ended_at IS NULL OR e.ended_at > b.ts)
-  GROUP BY b.ts
+),
+allocated AS (
+  SELECT
+    bucket_ts,
+    SUM(memory_mb::float * overlap_seconds) / 60.0           AS weighted_memory_mb,
+    SUM(memory_mb::float / 1024.0 * overlap_seconds)         AS gb_seconds,
+    COALESCE(SUM(overlap_seconds)::int, 0)                   AS uptime_seconds
+  FROM event_overlap
+  GROUP BY bucket_ts
 )
 SELECT
   b.ts,
-  COALESCE(a.gb_seconds, 0)::float                        AS memory_allocated_gb_seconds,
-  COALESCE(a.weighted_memory_mb, 0)::int                  AS allocated_memory_mb,
-  COALESCE(s.memory_bytes_avg::float / 1e9 * 60, 0)       AS memory_used_gb_seconds,
-  COALESCE((s.memory_bytes_avg / 1024 / 1024)::int, 0)    AS used_memory_mb_avg,
-  COALESCE((s.memory_bytes_peak / 1024 / 1024)::int, 0)   AS used_memory_mb_peak,
-  CASE WHEN s.bucket_ts IS NOT NULL THEN 60 ELSE 0 END    AS uptime_seconds
+  COALESCE(a.gb_seconds, 0)::float                                       AS memory_allocated_gb_seconds,
+  COALESCE(a.weighted_memory_mb, 0)::int                                 AS allocated_memory_mb,
+  COALESCE(s.memory_bytes_avg::float / 1073741824.0 * 60, 0)             AS memory_used_gb_seconds,
+  COALESCE((s.memory_bytes_avg / 1024 / 1024)::int, 0)                   AS used_memory_mb_avg,
+  COALESCE((s.memory_bytes_peak / 1024 / 1024)::int, 0)                  AS used_memory_mb_peak,
+  COALESCE(a.uptime_seconds, 0)                                          AS uptime_seconds
 FROM buckets b
 LEFT JOIN samples s   ON s.bucket_ts = b.ts
 LEFT JOIN allocated a ON a.bucket_ts = b.ts
