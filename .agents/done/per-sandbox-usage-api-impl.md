@@ -4,9 +4,14 @@ Working doc. Design is at `.agents/design/per-sandbox-usage-api.md`,
 signed off. v1 ships **memory only**; CPU is a follow-up gated on the
 `usage_collector.go:103` cgroup `cpu.stat` parse.
 
-## Status (post-implementation)
+## Status
 
-The implementation has landed on this branch. Outcomes:
+**Shipped on `feat/per-sandbox-usage-api` (PR #335).** Pgfixture suite
+6/6 green against the dev-box Postgres; fresh-eyes E2E walk from
+docs-only also worked (sandbox create → workload → curl → expected
+shape; math reconciled to the underlying samples table).
+
+Outcomes:
 
 - **Q1** (alias in response): kept inline. See design's "What gets
   dropped" section for the carved-out rationale.
@@ -23,8 +28,7 @@ The implementation has landed on this branch. Outcomes:
 - **Q5** (pgfixture vs pgtest): pgfixture, matching the existing
   reconciliation test.
 
-Two additional issues surfaced during review and were fixed in the
-same PR:
+Issues surfaced during review and fixed in the same PR:
 
 - **Boundary clamp bug** (over-reported by up to 2 minutes per call
   on the default `now-1h..now` window). Same fix as Q2.
@@ -35,6 +39,27 @@ same PR:
 - **Units**: `memory_bytes / 1073741824` (GiB) to align with the
   allocation side's `memory_mb / 1024` (also GiB). Wire field names
   keep the historical `Gb` for backwards compat with the aggregator.
+- **Overshoot divergence with `/api/usage`**: when an event's
+  `ended_at > to` the aggregator overshoots (inherited `GetOrgUsage`
+  quirk) while the new endpoint clamps. Pinned by
+  `TestSandboxUsagePoints_OvershootDivergence_pgfixture` so the
+  divergence is intentional, not a silent disagreement.
+
+Things added after the initial round:
+
+- **ISO date acceptance**: `from`/`to` now accept bare `YYYY-MM-DD`
+  (UTC midnight) in addition to RFC3339. Shared with the aggregator
+  via `parseUsageTimestamp`.
+- **Conceptual guide** at `docs/sandboxes/usage.mdx` with an embedded
+  SVG chart showing a 24h pattern (resize, peak, downtime) tied back
+  to specific response fields.
+- **Per-field response documentation** via Mintlify `<ResponseField>`
+  on both `get-sandbox-usage.mdx` and `get-usage.mdx`.
+- **TypeScript SDK reference page** at
+  `docs/reference/typescript-sdk/usage.mdx`.
+- **AGENTS.md rule** banning internal context (roadmap labels, schema
+  names, build artifacts, backwards-compat rationale) from
+  user-facing docs.
 
 Sections below capture the original plan and the SQL sketch — they
 are historical and do not necessarily reflect the final code. For the

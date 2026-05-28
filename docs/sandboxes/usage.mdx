@@ -180,4 +180,7 @@ Full TypeScript SDK reference: [Usage & Tags](/reference/typescript-sdk/usage).
 - If a measurement is missed, `uptimeSeconds` still reads 60 (the
   sandbox was running) but `usedMemoryMbAvg` reads 0 — visible as a
   brief dip under an otherwise continuous allocated line.
+- The first non-zero `usedMemoryMbAvg` for a freshly-created sandbox
+  appears a few minutes in. Workloads that finish faster than that
+  may not register any measured usage even though they ran.
 - Window max is **30 days**.
