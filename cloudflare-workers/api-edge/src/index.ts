@@ -98,10 +98,35 @@ interface Caller {
   userID: string | null;
 }
 
-// Authenticate via X-API-Key (looked up by sha256 in D1 api_keys). Session-JWT
-// auth (browser flows) is a TODO; SDK/test traffic uses the API key.
+function isWebSocketUpgrade(req: Request): boolean {
+  return req.headers.get("upgrade")?.toLowerCase() === "websocket";
+}
+
+function apiKeyFromRequest(req: Request): string | null {
+  const headerKey = req.headers.get("X-API-Key");
+  if (headerKey) return headerKey;
+
+  // Browser WebSocket clients cannot set custom headers, so SDK attach uses
+  // `?api_key=`. Keep this limited to Upgrade requests to avoid normalizing
+  // query-string credentials across the whole HTTP API.
+  if (isWebSocketUpgrade(req)) {
+    return new URL(req.url).searchParams.get("api_key");
+  }
+  return null;
+}
+
+function stripApiKeyQueryParam(target: string): string {
+  const url = new URL(target);
+  url.searchParams.delete("api_key");
+  return url.toString();
+}
+
+// Authenticate via X-API-Key (looked up by sha256 in D1 api_keys). For
+// WebSocket Upgrade requests, also accept ?api_key= because browser WS APIs
+// cannot set custom headers. Session-JWT auth (browser flows) is a TODO;
+// SDK/test traffic uses the API key.
 async function authenticate(req: Request, env: Env): Promise<Caller | null> {
-  const apiKey = req.headers.get("X-API-Key");
+  const apiKey = apiKeyFromRequest(req);
   if (!apiKey) return null;
   const hash = await sha256Hex(apiKey);
   const row = await env.OPENCOMPUTER_DB.prepare(
@@ -549,7 +574,7 @@ async function proxyToCellSDK(req: Request, env: Env, ctx: ExecutionContext, cal
   if (!cell) return json({ error: `cell ${row.cell_id} not registered` }, 503);
 
   const url = new URL(req.url);
-  const target = cell.base_url.replace(/\/$/, "") + url.pathname + url.search;
+  const target = stripApiKeyQueryParam(cell.base_url.replace(/\/$/, "") + url.pathname + url.search);
   // Look up the org's plan so the cap-token carries it (worker resolver uses
   // plan to tag usage_tick events; without it free-tier debit fan-out skips
   // the org).
@@ -611,7 +636,7 @@ async function proxyToCellSDK(req: Request, env: Env, ctx: ExecutionContext, cal
   // accept-key derivation). CF Workers + CF Tunnel forward WebSocket
   // upgrades transparently when you pass a Request clone — same pattern
   // handlePreviewURL uses and that's verified to work end-to-end with WS.
-  if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
+  if (isWebSocketUpgrade(req)) {
     const fwd = new Request(target, req);
     fwd.headers.set("authorization", "Bearer " + token);
     fwd.headers.delete("x-api-key");
