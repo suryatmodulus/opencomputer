@@ -15,10 +15,12 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/opensandbox/opensandbox/internal/analytics"
 	"github.com/opensandbox/opensandbox/internal/auth"
 	"github.com/opensandbox/opensandbox/internal/blobstore"
+	"github.com/opensandbox/opensandbox/internal/cellevents"
 	"github.com/opensandbox/opensandbox/internal/config"
 	"github.com/opensandbox/opensandbox/internal/db"
 	"github.com/opensandbox/opensandbox/internal/metrics"
@@ -426,11 +428,21 @@ func main() {
 			defer store.Close()
 			log.Println("opensandbox-worker: PostgreSQL store connected (auto-wake enabled)")
 
-			_, stopped, err := store.ReconcileWorkerSessions(ctx, cfg.WorkerID)
+			hibernated, stopped, err := store.ReconcileWorkerSessions(ctx, cfg.WorkerID)
 			if err != nil {
 				log.Printf("opensandbox-worker: warning: session reconciliation failed: %v", err)
-			} else if stopped > 0 {
-				log.Printf("opensandbox-worker: reconciled %d unrecoverable sessions as stopped", stopped)
+			} else {
+				if len(stopped) > 0 {
+					log.Printf("opensandbox-worker: reconciled %d unrecoverable sessions as stopped", len(stopped))
+				}
+				if len(hibernated) > 0 {
+					log.Printf("opensandbox-worker: reconciled %d sessions as hibernated", len(hibernated))
+				}
+				// Mirror PG state changes to D1 via the cell events stream.
+				// Without these XADDs, the dashboard keeps the rows at the
+				// pre-restart state ("running" on a worker that just rebooted).
+				emitReconcileEvents(ctx, cfg, "hibernated", "worker_restart", hibernated)
+				emitReconcileEvents(ctx, cfg, "stopped", "worker_restart", stopped)
 			}
 
 			// Wire up metadata server billing callback
@@ -676,8 +688,22 @@ func main() {
 					fixed, err := store.ReconcileWorkerReconnect(context.Background(), cfg.WorkerID, runningIDs)
 					if err != nil {
 						log.Printf("opensandbox-worker: reconnect reconciliation failed: %v", err)
-					} else if fixed > 0 {
-						log.Printf("opensandbox-worker: reconnect reconciliation: %d sessions restored to running", fixed)
+					} else if len(fixed) > 0 {
+						log.Printf("opensandbox-worker: reconnect reconciliation: %d sessions restored to running", len(fixed))
+						// Mirror to D1: emit `running` events so the dashboard
+						// reflects the recovery. Without these, D1 keeps the
+						// `error` status from the maintenance loop's previous
+						// sweep — customer sees their sandbox as broken until
+						// the next state-changing event.
+						//
+						// Bounded context so a redis stall during shutdown can't
+						// block this callback forever. Budget: 10s per event
+						// (3s XADD × up to 3 retries) × len(fixed), capped at
+						// 60s overall. Reconnect storms rarely produce more
+						// than a handful of fixed rows.
+						emitCtx, emitCancel := context.WithTimeout(context.Background(), 60*time.Second)
+						emitReconcileEvents(emitCtx, cfg, "running", "worker_reconnect", fixed)
+						emitCancel()
 					}
 				})
 			}
@@ -1143,6 +1169,30 @@ func processHibernateResults(results interface{}, store *db.Store, checkpointSto
 				_ = sandboxDBs.Remove(r.SandboxID)
 			}
 		}
+	}
+}
+
+// emitReconcileEvents XADDs a `cellevents.PublishLifecycle` per orphan to the
+// cell's events stream. Used by the worker-startup and worker-reconnect
+// reconcilers — both run rarely (boot, network blip) and need a redis client
+// just for the emit. Keeping the construction here means one URL parse + one
+// pool init + one Close per call site, instead of inlining the same dance
+// twice in main(). ctx must be bounded by the caller; the function does not
+// add its own timeout (cellevents.PublishLifecycle has a 3s XADD timeout per
+// attempt with up to 3 retries, so worst case ~10s per event).
+func emitReconcileEvents(ctx context.Context, cfg *config.Config, eventType, reason string, orphans []db.OrphanedSandbox) {
+	if len(orphans) == 0 || cfg.RedisURL == "" || cfg.CellID == "" {
+		return
+	}
+	opts, err := redis.ParseURL(cfg.RedisURL)
+	if err != nil {
+		log.Printf("opensandbox-worker: reconcile emit (%s): redis URL parse failed: %v — events skipped", eventType, err)
+		return
+	}
+	rdb := redis.NewClient(opts)
+	defer rdb.Close()
+	for _, o := range orphans {
+		cellevents.PublishLifecycle(ctx, rdb, cfg.CellID, eventType, o.SandboxID, o.WorkerID, o.OrgID, reason)
 	}
 }
 

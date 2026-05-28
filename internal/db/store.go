@@ -1315,34 +1315,63 @@ func (s *Store) UpdateSandboxSessionForWake(ctx context.Context, sandboxID, newW
 // ReconcileWorkerSessions marks stale "running" sessions for a worker on startup.
 // Sessions with an active checkpoint are set to "hibernated" (recoverable via wake-on-request).
 // Sessions without a checkpoint are set to "stopped" (VM is gone, no recovery possible).
-// Returns the count of sessions transitioned to each state.
-func (s *Store) ReconcileWorkerSessions(ctx context.Context, workerID string) (hibernated, stopped int, err error) {
+// Returns the affected sandbox identities so the caller can emit lifecycle
+// events; without them D1 drifts from PG every time a worker restarts.
+func (s *Store) ReconcileWorkerSessions(ctx context.Context, workerID string) (hibernated, stopped []OrphanedSandbox, err error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return 0, 0, fmt.Errorf("failed to begin tx: %w", err)
+		return nil, nil, fmt.Errorf("failed to begin tx: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
 	// First: mark sessions that have an active hibernation as "hibernated"
-	res1, err := tx.Exec(ctx,
+	hibernatedRows, err := tx.Query(ctx,
 		`UPDATE sandbox_sessions SET status = 'hibernated'
 		 WHERE worker_id = $1 AND status = 'running'
 		 AND sandbox_id IN (
 		     SELECT sandbox_id FROM sandbox_hibernations
 		     WHERE restored_at IS NULL AND expired_at IS NULL
-		 )`, workerID)
+		 )
+		 RETURNING sandbox_id, org_id, worker_id`, workerID)
 	if err != nil {
-		return 0, 0, fmt.Errorf("failed to reconcile hibernated sessions: %w", err)
+		return nil, nil, fmt.Errorf("failed to reconcile hibernated sessions: %w", err)
 	}
+	for hibernatedRows.Next() {
+		var o OrphanedSandbox
+		if scanErr := hibernatedRows.Scan(&o.SandboxID, &o.OrgID, &o.WorkerID); scanErr == nil {
+			hibernated = append(hibernated, o)
+		}
+	}
+	// Surface mid-iteration failures (conn drop, decode error). Without this,
+	// a truncated rows would yield a partial slice; the caller then emits
+	// events only for the rows it saw and the rest become D1 ghosts — exactly
+	// the bug this reconciler is meant to fix.
+	if rowsErr := hibernatedRows.Err(); rowsErr != nil {
+		hibernatedRows.Close()
+		return nil, nil, fmt.Errorf("iterating hibernated reconcile rows: %w", rowsErr)
+	}
+	hibernatedRows.Close()
 
 	// Second: mark remaining "running" sessions as "stopped"
-	res2, err := tx.Exec(ctx,
+	stoppedRows, err := tx.Query(ctx,
 		`UPDATE sandbox_sessions SET status = 'stopped', stopped_at = now(),
 		 error_msg = 'worker restarted'
-		 WHERE worker_id = $1 AND status = 'running'`, workerID)
+		 WHERE worker_id = $1 AND status = 'running'
+		 RETURNING sandbox_id, org_id, worker_id`, workerID)
 	if err != nil {
-		return int(res1.RowsAffected()), 0, fmt.Errorf("failed to reconcile stopped sessions: %w", err)
+		return hibernated, nil, fmt.Errorf("failed to reconcile stopped sessions: %w", err)
 	}
+	for stoppedRows.Next() {
+		var o OrphanedSandbox
+		if scanErr := stoppedRows.Scan(&o.SandboxID, &o.OrgID, &o.WorkerID); scanErr == nil {
+			stopped = append(stopped, o)
+		}
+	}
+	if rowsErr := stoppedRows.Err(); rowsErr != nil {
+		stoppedRows.Close()
+		return hibernated, nil, fmt.Errorf("iterating stopped reconcile rows: %w", rowsErr)
+	}
+	stoppedRows.Close()
 
 	// Close any open scale_events for sessions we just transitioned off running
 	// on this worker, so billing stops at reconciliation time.
@@ -1353,30 +1382,41 @@ func (s *Store) ReconcileWorkerSessions(ctx context.Context, workerID string) (h
 		       SELECT sandbox_id FROM sandbox_sessions
 		       WHERE worker_id = $1 AND status IN ('hibernated', 'stopped')
 		   )`, workerID); err != nil {
-		return int(res1.RowsAffected()), int(res2.RowsAffected()), fmt.Errorf("failed to close scale events: %w", err)
+		return hibernated, stopped, fmt.Errorf("failed to close scale events: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return 0, 0, fmt.Errorf("failed to commit reconcile tx: %w", err)
+		return nil, nil, fmt.Errorf("failed to commit reconcile tx: %w", err)
 	}
-	return int(res1.RowsAffected()), int(res2.RowsAffected()), nil
+	return hibernated, stopped, nil
 }
 
 // ReconcileWorkerReconnect fixes sandbox sessions after a worker reconnects from
 // a network outage. Sandboxes that are actually running locally but marked as
-// "error" in the DB are reset to "running". Returns the number of sessions fixed.
-func (s *Store) ReconcileWorkerReconnect(ctx context.Context, workerID string, runningSandboxIDs []string) (fixed int, err error) {
+// "error" in the DB are reset to "running". Returns the affected sandbox
+// identities so the caller can emit `running` events — without them D1 keeps
+// the old `error` status (or worse, drifts to whatever the maintenance loop
+// last wrote).
+func (s *Store) ReconcileWorkerReconnect(ctx context.Context, workerID string, runningSandboxIDs []string) (fixed []OrphanedSandbox, err error) {
 	if len(runningSandboxIDs) == 0 {
-		return 0, nil
+		return nil, nil
 	}
-	res, err := s.pool.Exec(ctx,
+	rows, err := s.pool.Query(ctx,
 		`UPDATE sandbox_sessions SET status = 'running', error_msg = NULL
 		 WHERE worker_id = $1 AND status = 'error'
-		 AND sandbox_id = ANY($2)`, workerID, runningSandboxIDs)
+		 AND sandbox_id = ANY($2)
+		 RETURNING sandbox_id, org_id, worker_id`, workerID, runningSandboxIDs)
 	if err != nil {
-		return 0, fmt.Errorf("reconcile worker reconnect: %w", err)
+		return nil, fmt.Errorf("reconcile worker reconnect: %w", err)
 	}
-	return int(res.RowsAffected()), nil
+	defer rows.Close()
+	for rows.Next() {
+		var o OrphanedSandbox
+		if scanErr := rows.Scan(&o.SandboxID, &o.OrgID, &o.WorkerID); scanErr == nil {
+			fixed = append(fixed, o)
+		}
+	}
+	return fixed, rows.Err()
 }
 
 // UpsertWorkspaceBackup creates or updates a workspace-only backup record for a sandbox.
