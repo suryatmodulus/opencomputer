@@ -76,6 +76,7 @@ class Sandbox:
         envs: dict[str, str] | None = None,
         metadata: dict[str, str] | None = None,
         disk_mb: int | None = None,
+        memory_mb: int | None = None,
         secret_store: str | None = None,
         image: Image | None = None,
         snapshot: str | None = None,
@@ -95,6 +96,9 @@ class Sandbox:
                 comparable to EBS gp3. Closed beta: requests above 20GB
                 require the org's ``max_disk_mb`` to be raised. Contact us:
                 https://cal.com/team/digger/opencomputer-founder-chat
+            memory_mb: Memory in MB. On a snapshot/checkpoint fork the server
+                clamps this to [snapshot memory, 16 GB]; the new sandbox's
+                ``memory_mb`` reflects the effective value.
             secret_store: Secret store name — resolves encrypted secrets
                 and egress allowlist.
             image: Declarative Image definition. The server builds and caches it as a checkpoint.
@@ -132,6 +136,8 @@ class Sandbox:
             body["metadata"] = metadata
         if disk_mb is not None:
             body["diskMB"] = disk_mb
+        if memory_mb is not None:
+            body["memoryMB"] = memory_mb
         if secret_store:
             body["secretStore"] = secret_store
         if image is not None:
@@ -269,6 +275,32 @@ class Sandbox:
         """
         resp = await self._client.post(f"/sandboxes/{self.sandbox_id}/power-cycle")
         resp.raise_for_status()
+
+    async def hibernate(self) -> None:
+        """Hibernate the sandbox.
+
+        Snapshots the running VM (RAM + disk) to storage and frees its worker
+        slot. The sandbox keeps its ID, disks, env, and secrets; in-memory
+        process state is preserved and restored on :meth:`wake`. Compute
+        billing stops while hibernated (only storage is metered).
+        """
+        resp = await self._client.post(f"/sandboxes/{self.sandbox_id}/hibernate")
+        resp.raise_for_status()
+        self.status = "hibernated"
+
+    async def wake(self, timeout: int | None = None) -> None:
+        """Wake a hibernated sandbox.
+
+        Restores the VM from its hibernation snapshot on a worker — running
+        processes resume where they left off. Optionally set a new idle
+        ``timeout`` (seconds; ``0`` = persistent, never auto-hibernate).
+        """
+        body: dict[str, Any] = {}
+        if timeout is not None:
+            body["timeout"] = timeout
+        resp = await self._client.post(f"/sandboxes/{self.sandbox_id}/wake", json=body)
+        resp.raise_for_status()
+        self.status = "running"
 
     async def is_running(self) -> bool:
         """Check if the sandbox is still running."""
