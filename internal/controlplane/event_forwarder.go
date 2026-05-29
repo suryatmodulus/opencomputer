@@ -198,7 +198,13 @@ func (f *EventForwarder) reclaimOnce(ctx context.Context) {
 		for _, p := range pending {
 			ids = append(ids, p.ID)
 		}
-		msgs, err := f.rdb.XClaim(ctx, &redis.XClaimArgs{
+		// XClaimJustID, not XClaim: when the PEL references messages already
+		// trimmed out of the stream, XClaim (full) returns nil bodies for them
+		// and go-redis surfaces that as "redis: nil", aborting the whole batch
+		// and leaving the orphaned entries stuck forever. JUSTID returns only the
+		// ids it claimed (no body parse) so we take ownership of every stale
+		// entry; MinIdle still skips fresh, in-flight messages.
+		claimedIDs, err := f.rdb.XClaimJustID(ctx, &redis.XClaimArgs{
 			Stream:   f.streamKey,
 			Group:    f.groupName,
 			Consumer: f.consumer,
@@ -209,8 +215,20 @@ func (f *EventForwarder) reclaimOnce(ctx context.Context) {
 			log.Printf("event_forwarder: XCLAIM error (%d ids): %v", len(ids), err)
 			return
 		}
-		if len(msgs) > 0 {
-			f.processBatch(ctx, msgs)
+		// Re-fetch each claimed id from the stream: still present → reprocess
+		// (processBatch acks on success); trimmed away → ack to clear the
+		// orphaned PEL entry, since the data is gone and can't be forwarded.
+		for _, id := range claimedIDs {
+			entries, rerr := f.rdb.XRange(ctx, f.streamKey, id, id).Result()
+			if rerr != nil {
+				log.Printf("event_forwarder: XRANGE %s error: %v", id, rerr)
+				continue
+			}
+			if len(entries) == 0 {
+				f.ack(ctx, id)
+				continue
+			}
+			f.processBatch(ctx, entries)
 		}
 		// Next page starts strictly after the last id we just processed; if the
 		// batch was short, we're done.
