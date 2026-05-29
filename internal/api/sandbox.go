@@ -21,7 +21,6 @@ import (
 	pb "github.com/opensandbox/opensandbox/proto/worker"
 )
 
-
 func (s *Server) createSandbox(c echo.Context) error {
 	var cfg types.SandboxConfig
 	if err := c.Bind(&cfg); err != nil {
@@ -142,7 +141,7 @@ func (s *Server) createSandbox(c echo.Context) error {
 		// on the fork. User envs override checkpoint's stored envs.
 		// Secret store: if checkpoint has none, user can attach one at fork time.
 		// If checkpoint already has one, user cannot override it.
-		result, status, cpErr := s.createFromCheckpointCore(c, cfg.Envs, cfg.SecretStore, cfg.Metadata)
+		result, status, cpErr := s.createFromCheckpointCore(c, cfg.Envs, cfg.SecretStore, cfg.Metadata, cfg.MemoryMB)
 		if cpErr != nil {
 			return c.JSON(status, map[string]string{"error": cpErr.Error()})
 		}
@@ -301,7 +300,7 @@ func (s *Server) createSandboxWithSSE(c echo.Context, ctx context.Context, orgID
 
 	c.SetParamNames("checkpointId")
 	c.SetParamValues(checkpointID.String())
-	result, _, cpErr := s.createFromCheckpointCore(c, cfg.Envs, cfg.SecretStore, cfg.Metadata)
+	result, _, cpErr := s.createFromCheckpointCore(c, cfg.Envs, cfg.SecretStore, cfg.Metadata, cfg.MemoryMB)
 	if cpErr != nil {
 		emit("error", map[string]string{"error": cpErr.Error()})
 		return nil
@@ -1168,6 +1167,23 @@ func (s *Server) migrateSandbox(c echo.Context) error {
 	})
 }
 
+// effectivePlan returns the org's billing plan for org-policy gates. It
+// prefers the value the edge stamped into the cap-token (authoritative, fresh
+// from D1) and falls back to the cell-local orgs row for legacy direct-to-cell
+// callers that authenticate with a raw API key (no cap-token). Returns "" when
+// neither source is available, in which case callers should not gate.
+func (s *Server) effectivePlan(c echo.Context, orgID uuid.UUID) string {
+	if plan, ok := auth.GetPlan(c); ok {
+		return plan
+	}
+	if s.store != nil {
+		if org, err := s.store.GetOrg(c.Request().Context(), orgID); err == nil && org != nil {
+			return org.Plan
+		}
+	}
+	return ""
+}
+
 func (s *Server) setLimits(c echo.Context) error {
 	id := c.Param("id")
 	ctx := c.Request().Context()
@@ -1193,14 +1209,13 @@ func (s *Server) setLimits(c echo.Context) error {
 		}
 	}
 
-	// Free tier: block scaling beyond 4GB / 1 vCPU
-	if orgID, hasOrg := auth.GetOrgID(c); hasOrg && s.store != nil {
-		if org, err := s.store.GetOrg(ctx, orgID); err == nil && org.Plan == "free" {
-			if req.MemoryMB > 4096 || req.CPUPercent > 100 {
-				return c.JSON(http.StatusPaymentRequired, map[string]string{
-					"error": "upgrade to pro for larger instances",
-				})
-			}
+	// Free tier: block scaling beyond 4GB / 1 vCPU. Plan comes from the
+	// cap-token (edge-authoritative) when present, else the cell-PG copy.
+	if orgID, hasOrg := auth.GetOrgID(c); hasOrg {
+		if s.effectivePlan(c, orgID) == "free" && (req.MemoryMB > 4096 || req.CPUPercent > 100) {
+			return c.JSON(http.StatusPaymentRequired, map[string]string{
+				"error": "upgrade to pro for larger instances",
+			})
 		}
 	}
 
@@ -1250,14 +1265,13 @@ func (s *Server) scaleSandbox(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 	}
 
-	// Free tier: block scaling beyond 4GB / 1 vCPU
-	if orgID, hasOrg := auth.GetOrgID(c); hasOrg && s.store != nil {
-		if org, err := s.store.GetOrg(c.Request().Context(), orgID); err == nil && org.Plan == "free" {
-			if req.MemoryMB > 4096 {
-				return c.JSON(http.StatusPaymentRequired, map[string]string{
-					"error": "upgrade to pro for larger instances",
-				})
-			}
+	// Free tier: block scaling beyond 4GB. Plan comes from the cap-token
+	// (edge-authoritative) when present, else the cell-PG copy.
+	if orgID, hasOrg := auth.GetOrgID(c); hasOrg {
+		if s.effectivePlan(c, orgID) == "free" && req.MemoryMB > 4096 {
+			return c.JSON(http.StatusPaymentRequired, map[string]string{
+				"error": "upgrade to pro for larger instances",
+			})
 		}
 	}
 
@@ -1305,8 +1319,8 @@ func (s *Server) scaleSandbox(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 	}
 	return c.JSON(http.StatusOK, map[string]interface{}{
-		"sandboxID": id,
-		"memoryMB":  req.MemoryMB,
+		"sandboxID":  id,
+		"memoryMB":   req.MemoryMB,
 		"cpuPercent": cpuPercent,
 	})
 }
@@ -2373,9 +2387,10 @@ func (s *Server) createFromCheckpoint(c echo.Context) error {
 		Envs        map[string]string `json:"envs"`
 		SecretStore string            `json:"secretStore"`
 		Metadata    map[string]string `json:"metadata"`
+		MemoryMB    int               `json:"memoryMB"`
 	}
 	_ = c.Bind(&body)
-	result, httpStatus, err := s.createFromCheckpointCore(c, body.Envs, body.SecretStore, body.Metadata)
+	result, httpStatus, err := s.createFromCheckpointCore(c, body.Envs, body.SecretStore, body.Metadata, body.MemoryMB)
 	if err != nil {
 		return c.JSON(httpStatus, map[string]string{"error": err.Error()})
 	}
@@ -2401,7 +2416,7 @@ func (s *Server) createFromCheckpoint(c echo.Context) error {
 // metadata before the sandbox session row is recorded — so callers can
 // stamp request-time identifiers (e.g. agent_id) without losing whatever
 // the snapshot author baked in.
-func (s *Server) createFromCheckpointCore(c echo.Context, userEnvs map[string]string, userSecretStore string, userMetadata map[string]string) (map[string]interface{}, int, error) {
+func (s *Server) createFromCheckpointCore(c echo.Context, userEnvs map[string]string, userSecretStore string, userMetadata map[string]string, userMemoryMB int) (map[string]interface{}, int, error) {
 	checkpointIDStr := c.Param("checkpointId")
 	ctx := c.Request().Context()
 
@@ -2414,21 +2429,12 @@ func (s *Server) createFromCheckpointCore(c echo.Context, userEnvs map[string]st
 		return nil, http.StatusUnauthorized, fmt.Errorf("org context required")
 	}
 
-	// Enforce per-org concurrency limit on the fork path, mirroring the gate
-	// in the direct-create path at the top of CreateSandbox (around line 50).
-	// Without this, callers using POST /api/sandboxes/from-checkpoint/<id>
-	// (i.e. `oc checkpoint spawn` and equivalent SDK calls) can fork unbounded
-	// sandboxes past their plan's max_concurrent_sandboxes — every other
-	// per-plan gate (free-tier credits, machine size, disk size) is also
-	// missing on this path, but concurrency is the load-bearing one because
-	// it directly drives runaway billing.
-	//
-	// Fail-open on DB errors to match the existing direct-create behavior.
-	if org, gerr := s.store.GetOrg(ctx, orgID); gerr == nil {
-		if count, cerr := s.store.CountActiveSandboxes(ctx, orgID); cerr == nil && count >= org.MaxConcurrentSandboxes {
-			return nil, http.StatusTooManyRequests, fmt.Errorf("concurrent sandbox limit reached")
-		}
-	}
+	// Org-policy gates (concurrency, plan tier, disk) are enforced at the edge
+	// against D1 before this request is dispatched — see enforceCreatePolicy in
+	// cloudflare-workers/api-edge/src/index.ts. A cell can only count its own
+	// sandboxes, so a per-cell concurrency check is wrong once an org spans
+	// cells; the edge counts the global sandboxes_index instead. This handler
+	// trusts the cap-token and only validates physical bounds downstream.
 
 	checkpointID, err := uuid.Parse(checkpointIDStr)
 	if err != nil {
@@ -2563,6 +2569,12 @@ func (s *Server) createFromCheckpointCore(c echo.Context, userEnvs map[string]st
 		}
 	}
 
+	// Honor a caller-supplied memoryMB on the fork. The worker clamps it to
+	// [snapshot floor, hotplug ceiling] and returns the effective value below.
+	if userMemoryMB > 0 {
+		originalCfg.MemoryMB = userMemoryMB
+	}
+
 	// Resolve timeout. With int-valued JSON fields we can't distinguish "not sent"
 	// from "explicitly zero", so treat req.Timeout as authoritative. Fall back to
 	// the checkpoint's original timeout only when req.Timeout is negative (which is
@@ -2653,12 +2665,13 @@ func (s *Server) createFromCheckpointCore(c echo.Context, userEnvs map[string]st
 	// immediate hibernate/restore/etc. to route to a worker whose m.vms[id] was
 	// not yet populated and 500 with "sandbox not found".
 	var createErr error
+	var effectiveMemoryMB int
 	if grpcClient != nil {
 		// Use background context — the fork has its own internal timeouts
 		// (30s agent connect, 10s QMP, 5s network patch). An external deadline
 		// here causes orphaned VMs: the gRPC layer returns DeadlineExceeded
 		// while the worker finishes creating the VM, leaving it untracked.
-		_, createErr = grpcClient.CreateSandbox(context.Background(), &pb.CreateSandboxRequest{
+		resp, err := grpcClient.CreateSandbox(context.Background(), &pb.CreateSandboxRequest{
 			Template:             originalCfg.Template,
 			Timeout:              int32(timeout),
 			Envs:                 originalCfg.Envs,
@@ -2674,6 +2687,10 @@ func (s *Server) createFromCheckpointCore(c echo.Context, userEnvs map[string]st
 			SecretAllowedHosts:   flattenSecretAllowedHosts(originalCfg.SecretAllowedHosts),
 			SecretEnvs:           originalCfg.SecretEnvs,
 		})
+		createErr = err
+		if resp != nil {
+			effectiveMemoryMB = int(resp.MemoryMb)
+		}
 	} else {
 		// Combined mode: create locally — no external timeout, same reasoning as above
 		cfg := originalCfg
@@ -2687,9 +2704,17 @@ func (s *Server) createFromCheckpointCore(c echo.Context, userEnvs map[string]st
 			ForkFromCheckpoint(ctx context.Context, checkpointID string, cfg types.SandboxConfig) (*types.Sandbox, error)
 		})
 		if hasFork {
-			_, createErr = forkMgr.ForkFromCheckpoint(context.Background(), checkpointID.String(), cfg)
+			sb, err := forkMgr.ForkFromCheckpoint(context.Background(), checkpointID.String(), cfg)
+			createErr = err
+			if sb != nil {
+				effectiveMemoryMB = sb.MemoryMB
+			}
 		} else {
-			_, createErr = s.manager.Create(context.Background(), cfg)
+			sb, err := s.manager.Create(context.Background(), cfg)
+			createErr = err
+			if sb != nil {
+				effectiveMemoryMB = sb.MemoryMB
+			}
 		}
 	}
 
@@ -2735,6 +2760,11 @@ func (s *Server) createFromCheckpointCore(c echo.Context, userEnvs map[string]st
 	}
 	if s.sandboxDomain != "" {
 		result["sandboxDomain"] = s.sandboxDomain
+	}
+	// Effective memory after worker-side floor/ceiling clamping — lets callers
+	// (and the edge's sandboxes_index) detect when memoryMB was adjusted.
+	if effectiveMemoryMB > 0 {
+		result["memoryMB"] = effectiveMemoryMB
 	}
 	return result, http.StatusCreated, nil
 }
