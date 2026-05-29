@@ -167,6 +167,38 @@ curl -X POST https://app.opencomputer.dev/api/sandboxes \
 
 </CodeGroup>
 
+### Sizing a fork's memory
+
+A sandbox created from a snapshot inherits the snapshot's memory by default. Pass `memoryMB` to give it more RAM — useful when one branch needs more headroom than the base.
+
+<CodeGroup>
+
+```typescript TypeScript
+// Fork the snapshot with 8 GB instead of its captured size
+const sandbox = await Sandbox.create({ snapshot: 'data-science', memoryMB: 8192 });
+```
+
+```python Python
+# Fork the snapshot with 8 GB instead of its captured size
+sandbox = await Sandbox.create(snapshot="data-science", memory_mb=8192)
+```
+
+```bash curl
+curl -X POST https://app.opencomputer.dev/api/sandboxes \
+  -H "X-API-Key: $OPENCOMPUTER_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"snapshot": "data-science", "memoryMB": 8192}'
+```
+
+</CodeGroup>
+
+`memoryMB` is clamped to a valid range, and the response's `memoryMB` reports the effective value:
+
+- **Floor — the snapshot's own memory.** A smaller request is ignored; a fork can't start smaller than the snapshot it restores. A 4 GB snapshot forked with `memoryMB: 1024` still boots at ~4 GB.
+- **Ceiling — 16 GB.** Larger requests are capped (`32768` → `16384`).
+
+The same `memoryMB` field works when [forking from a checkpoint](/api-reference/checkpoints/fork).
+
 ### Managing snapshots
 
 <CodeGroup>
