@@ -974,6 +974,41 @@ func (s *Store) ListSandboxSessions(ctx context.Context, orgID uuid.UUID, status
 	return sessions, nil
 }
 
+// ListSandboxIDsByWorkerStatus returns sandbox IDs (the public sb-... form,
+// not the row UUID) for sessions on a specific worker with a specific status.
+// Used by the reconcile-on-reconnect sweep: when a worker rejoins after being
+// pruned for missed heartbeats, the cell may have published "stopped"
+// lifecycle events during the unreachable window (internal/api/sandbox.go's
+// worker_unreachable fallback). This query identifies those entries so the
+// reconcile can re-issue Destroy and clean the worker's m.vms.
+//
+// Bounded to sessions whose stopped_at is within the last 24h — older entries
+// have presumably been cleaned by worker restarts or the ghost reaper, and
+// scanning them just wastes RPC round-trips.
+func (s *Store) ListSandboxIDsByWorkerStatus(ctx context.Context, workerID, status string) ([]string, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT sandbox_id FROM sandbox_sessions
+		 WHERE worker_id = $1 AND status = $2
+		   AND stopped_at IS NOT NULL
+		   AND stopped_at > NOW() - INTERVAL '24 hours'
+		 ORDER BY stopped_at DESC
+		 LIMIT 1000`,
+		workerID, status)
+	if err != nil {
+		return nil, fmt.Errorf("list sandboxes by worker+status: %w", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 func (s *Store) CountActiveSandboxes(ctx context.Context, orgID uuid.UUID) (int, error) {
 	var count int
 	err := s.pool.QueryRow(ctx,

@@ -184,6 +184,21 @@ func main() {
 		if err != nil {
 			log.Fatalf("failed to connect to Redis: %v", err)
 		}
+		// Reconcile-on-reconnect: when a worker rejoins after being pruned
+		// for missed heartbeats, sweep the cell's view of "stopped sandboxes
+		// on this worker" and re-issue Destroy. Closes the gap where the
+		// cell-side fallback at internal/api/sandbox.go's destroy handler
+		// published "stopped" while the worker was unreachable but qemu
+		// kept running. See internal/controlplane/reconcile.go.
+		//
+		// Captured opts.Store (set above) directly — the closure reads it
+		// at call time so any later mutations are picked up.
+		redisRegistry.OnWorkerRejoined(func(workerID string) {
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			controlplane.ReconcileStoppedOnWorker(ctx, redisRegistry, opts.Store, workerID)
+		})
+
 		redisRegistry.Start()
 		defer redisRegistry.Stop()
 		opts.WorkerRegistry = redisRegistry
