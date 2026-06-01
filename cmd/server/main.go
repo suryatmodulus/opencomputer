@@ -184,6 +184,29 @@ func main() {
 		if err != nil {
 			log.Fatalf("failed to connect to Redis: %v", err)
 		}
+		// Reconcile-on-reconnect: when a worker rejoins after being pruned
+		// for missed heartbeats, run both directions of the cell-vs-worker
+		// state reconcile. See internal/controlplane/reconcile.go for the
+		// full rationale on each. Captured opts.Store + cfg.CellID directly;
+		// the closure reads them at call time.
+		//
+		//   reverse first: cell-running but worker-doesn't-have-it →
+		//     close on cell side (UpdateSessionStatus + EndScaleEvent +
+		//     publish stopped event). Stops the billing leak immediately.
+		//
+		//   forward second: cell-stopped but worker-still-hosting →
+		//     re-issue Destroy via RPC. Cleans the worker side.
+		//
+		// Reverse runs first because the more urgent dollars-on-fire case is
+		// the still-open scale event accruing minute-by-minute, not a stray
+		// qemu the worker still has.
+		redisRegistry.OnWorkerRejoined(func(workerID string) {
+			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+			defer cancel()
+			controlplane.ReconcileRunningOnWorker(ctx, redisRegistry, opts.Store, cfg.CellID, workerID)
+			controlplane.ReconcileStoppedOnWorker(ctx, redisRegistry, opts.Store, workerID)
+		})
+
 		redisRegistry.Start()
 		defer redisRegistry.Stop()
 		opts.WorkerRegistry = redisRegistry
