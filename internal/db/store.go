@@ -974,6 +974,40 @@ func (s *Store) ListSandboxSessions(ctx context.Context, orgID uuid.UUID, status
 	return sessions, nil
 }
 
+// WorkerSandboxRef is the minimum (sandbox_id, org_id) tuple the reverse-direction
+// reconcile needs to close orphaned sessions and emit lifecycle events.
+type WorkerSandboxRef struct {
+	SandboxID string
+	OrgID     uuid.UUID
+}
+
+// ListSandboxesByWorkerStatus returns the (sandbox_id, org_id) pairs for sessions
+// on a worker with a given status. Used by the reverse-direction reconcile:
+// when a worker rejoins after a gap, we look up what cell PG thinks is *running*
+// on that worker, ask the worker what it actually has, and close any cell-PG row
+// the worker doesn't claim. Bounded to 1000 rows so a runaway query never blows.
+func (s *Store) ListSandboxesByWorkerStatus(ctx context.Context, workerID, status string) ([]WorkerSandboxRef, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT sandbox_id, org_id FROM sandbox_sessions
+		 WHERE worker_id = $1 AND status = $2
+		 ORDER BY started_at DESC
+		 LIMIT 1000`,
+		workerID, status)
+	if err != nil {
+		return nil, fmt.Errorf("list sandboxes by worker+status: %w", err)
+	}
+	defer rows.Close()
+	var refs []WorkerSandboxRef
+	for rows.Next() {
+		var r WorkerSandboxRef
+		if err := rows.Scan(&r.SandboxID, &r.OrgID); err != nil {
+			return nil, err
+		}
+		refs = append(refs, r)
+	}
+	return refs, rows.Err()
+}
+
 // ListSandboxIDsByWorkerStatus returns sandbox IDs (the public sb-... form,
 // not the row UUID) for sessions on a specific worker with a specific status.
 // Used by the reconcile-on-reconnect sweep: when a worker rejoins after being

@@ -150,10 +150,32 @@ export default {
           SET status = 'hibernated', last_event_at = ?1
         WHERE id = ?2 AND (last_event_at IS NULL OR last_event_at < ?1)`,
     );
+    // INSERT ON CONFLICT, not plain UPDATE — the previous UPDATE-only shape
+    // relied on the api-edge's `ctx.waitUntil` POST /api/sandboxes write to
+    // have already created the row. When that waitUntil dropped (CF Worker
+    // eviction mid-request, common under batch-create load), the row never
+    // existed, this UPDATE no-op'd, and the sandbox stayed invisible in D1
+    // until the next lifecycle event also no-op'd. The empirical fingerprint
+    // was 34 of 50 still-running sandboxes for one large org being absent
+    // from sandboxes_index despite having `created` events in D1 events.
+    //
+    // With INSERT ON CONFLICT, events-ingest is self-sufficient: every
+    // `created` / `running` / `woke` event guarantees the row.
+    //
+    // Monotonic guard applies only to the UPDATE branch — a newer event
+    // wins; an out-of-order older event is ignored. On INSERT (no conflict)
+    // the row is created with this event's ts as the high-water mark.
+    //
+    // Binding order: ?1=tsSec, ?2=sandbox_id, ?3=org_id, ?4=cell_id, ?5=worker_id
     const lifecycleRunning = env.OPENCOMPUTER_DB.prepare(
-      `UPDATE sandboxes_index
-          SET status = 'running', stopped_at = NULL, last_event_at = ?1
-        WHERE id = ?2 AND (last_event_at IS NULL OR last_event_at < ?1)`,
+      `INSERT INTO sandboxes_index (id, org_id, cell_id, worker_id, status, created_at, last_event_at)
+       VALUES (?2, ?3, ?4, ?5, 'running', ?1, ?1)
+       ON CONFLICT(id) DO UPDATE SET
+         status = 'running',
+         worker_id = COALESCE(excluded.worker_id, sandboxes_index.worker_id),
+         stopped_at = NULL,
+         last_event_at = ?1
+       WHERE sandboxes_index.last_event_at IS NULL OR sandboxes_index.last_event_at < ?1`,
     );
     // Migration: sandbox moved to a new worker. Update worker_id alongside
     // status so proxyToCellSDK + dashboard reflect the new home immediately
@@ -198,10 +220,17 @@ export default {
           // worker_id field rather than payload for these events.
           return lifecycleMigrated.bind(e.worker_id ?? "", tsSec, e.sandbox_id);
         }
-        // "running", "created" set the row to running (created is handled
-        // by the edge on POST, but accept here for redundancy in case of
-        // replay against a future cell-only create path).
-        return lifecycleRunning.bind(tsSec, e.sandbox_id);
+        // "running", "created", "woke" set the row to running. Since the
+        // INSERT-ON-CONFLICT upgrade, this path also creates the row if the
+        // edge's waitUntil dropped on POST /api/sandboxes — events-ingest no
+        // longer depends on the edge having written first.
+        return lifecycleRunning.bind(
+          tsSec,
+          e.sandbox_id,
+          e.org_id ?? "",
+          e.cell_id ?? "",
+          e.worker_id ?? null,
+        );
       });
 
     // Checkpoint lifecycle: keep D1 checkpoints_index in sync with cell PG
