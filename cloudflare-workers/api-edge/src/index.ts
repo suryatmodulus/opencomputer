@@ -872,6 +872,58 @@ async function orgPolicy(req: Request, env: Env): Promise<Response> {
   });
 }
 
+// ── /internal/usage-parity ────────────────────────────────────────────────
+
+// HMAC-auth'd read-only endpoint the cell's usage-parity checker polls to
+// compare edge-measured Pro usage against the cell's authoritative
+// sandbox_scale_events. Returns per-org GB-seconds over [from,to) computed from
+// the RAW tick samples (usage_samples), not the priced meter rows — the point
+// is to validate measurement (ticks vs scale-event intervals) independent of
+// the rollup/pricing layer, and it works for legacy and unified alike because
+// GB-seconds is mode-independent.
+//
+// from/to are unix seconds; samples are keyed by ts (unix ms). Same HMAC scheme
+// as haltList/orgPolicy. NOTE: this reads usage_samples, so the sample-retention
+// window must exceed the parity lookback (samples aren't deleted at rollup, only
+// flagged rolled_up).
+async function usageParity(req: Request, env: Env): Promise<Response> {
+  const ts = req.headers.get("X-Timestamp") ?? "";
+  const sig = req.headers.get("X-Signature") ?? "";
+  if (!ts || !sig) return json({ error: "missing signature headers" }, 400);
+  const tsNum = Number.parseInt(ts, 10);
+  if (!Number.isFinite(tsNum)) return json({ error: "invalid timestamp" }, 400);
+  const now = Math.floor(Date.now() / 1000);
+  if (Math.abs(now - tsNum) > 5 * 60) return json({ error: "timestamp out of window" }, 401);
+
+  const url = new URL(req.url);
+  const expected = await hmacHex(env.EVENT_SECRET, `${ts}.${url.pathname}${url.search}`);
+  if (!constantTimeEqual(expected, sig)) return json({ error: "signature mismatch" }, 401);
+
+  const from = Number.parseInt(url.searchParams.get("from") ?? "", 10);
+  const to = Number.parseInt(url.searchParams.get("to") ?? "", 10);
+  if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) {
+    return json({ error: "from/to required (unix seconds, to > from)" }, 400);
+  }
+
+  const res = await env.OPENCOMPUTER_DB.prepare(
+    `SELECT org_id AS org_id,
+            SUM(memory_mb * interval_s) AS mem_mb_secs,
+            COUNT(*) AS samples
+       FROM usage_samples
+      WHERE ts >= ?1 AND ts < ?2
+      GROUP BY org_id`,
+  )
+    .bind(from * 1000, to * 1000)
+    .all<{ org_id: string; mem_mb_secs: number; samples: number }>();
+
+  const orgs = (res.results ?? []).map((r) => ({
+    org_id: r.org_id,
+    gb_seconds: (r.mem_mb_secs ?? 0) / 1024,
+    samples: r.samples ?? 0,
+  }));
+  return json({ window: { from, to }, orgs, as_of: now });
+}
+
 async function hmacHex(secret: string, data: string): Promise<string> {
   const key = await crypto.subtle.importKey(
     "raw",
@@ -1278,6 +1330,11 @@ export default {
     if (path === "/internal/org-policy") {
       if (req.method !== "GET") return json({ error: "method not allowed" }, 405);
       return orgPolicy(req, env);
+    }
+
+    if (path === "/internal/usage-parity") {
+      if (req.method !== "GET") return json({ error: "method not allowed" }, 405);
+      return usageParity(req, env);
     }
 
     // /internal/admin/do-mark-free — operator-only escape hatch to flip a

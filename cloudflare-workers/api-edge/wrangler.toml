@@ -68,6 +68,19 @@ script_name = "opensandbox-edge-dev"
 tag = "v1"
 new_sqlite_classes = ["CreditAccount"]
 
+# v2 was applied to the deployed dev worker out-of-band (it created a
+# SandboxWsGateway DO from a branch never merged here). Placeholder so the
+# ledger is contiguous and wrangler can append v3.
+[[migrations]]
+tag = "v2"
+
+# This branch doesn't define SandboxWsGateway. Delete the orphaned class +
+# its DOs so this branch can deploy (CF blocks dropping a depended-on class
+# without an explicit delete-class migration). CreditAccount is untouched.
+[[migrations]]
+tag = "v3"
+deleted_classes = ["SandboxWsGateway"]
+
 # Secrets (set via `wrangler secret put`):
 #   SESSION_JWT_SECRET     — HMAC for session JWT (shared with all CPs in cell fleet)
 #   CF_ADMIN_SECRET        — HMAC for /admin/halt-org and /admin/resume-org callbacks to CPs

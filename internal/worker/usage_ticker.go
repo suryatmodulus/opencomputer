@@ -24,13 +24,22 @@ import (
 //   - The worker is the only place that actually owns running VMs.
 //   - The DO can't self-schedule per-sandbox debit cadence.
 //
-// Cost model: every tick contributes a fixed cents amount per sandbox. For
-// the dev/test bed this is set so that a free org's $5 seed exhausts in
-// ~5 minutes of continuous running at the default interval — short enough
-// to validate the halt loop, long enough that quick smoke tests don't
-// burn the credit. Production should compute cents from RAM + CPU usage
-// (memory_gb_seconds, cpu_seconds) — wired the same way, just a richer
-// payload.
+// Cost model — two consumers off the same event:
+//   - Free tier: every tick contributes a fixed `cost_cents` per sandbox,
+//     debited against the org's DO balance. For the dev/test bed this is
+//     set so a free org's $5 seed exhausts in ~5 minutes of continuous
+//     running at the default interval — short enough to validate the halt
+//     loop, long enough that quick smoke tests don't burn the credit.
+//   - Pro tier: the tick also carries the sandbox's resource dimensions
+//     (memory_mb, cpu_count, interval_s). events-ingest lands these into D1
+//     `usage_samples` for pro orgs; a rollup cron turns the samples into
+//     memory_gb_seconds and meters them to Stripe. This is the edge analog
+//     of the cell's `sandbox_scale_events` table — sampled per tick rather
+//     than recorded as open/close intervals, so a worker death just stops
+//     the samples instead of leaving a dangling open billing row.
+//
+// The worker is the only component with per-sandbox tier granularity, which
+// is why the dimensions are stamped here rather than reconstructed downstream.
 type UsageTicker struct {
 	manager       sandbox.Manager
 	sandboxDBs    *sandbox.SandboxDBManager
@@ -133,9 +142,15 @@ func (t *UsageTicker) tick(ctx context.Context) {
 			continue
 		}
 		if err := sdb.LogEvent("usage_tick", map[string]interface{}{
-			"sandbox_id":  sb.ID,
-			"cost_cents":  t.costPerTickCs,
-			"interval_s":  int(t.interval.Seconds()),
+			"sandbox_id": sb.ID,
+			"cost_cents": t.costPerTickCs,
+			"interval_s": int(t.interval.Seconds()),
+			// Resource dimensions for pro-tier metering on the edge. Free
+			// orgs ignore these (they debit cost_cents); pro orgs land them
+			// in D1 usage_samples. MemoryMB/CpuCount come straight off the
+			// running VM's tier — the worker owns the VM so these are exact.
+			"memory_mb": sb.MemoryMB,
+			"cpu_count": sb.CpuCount,
 		}); err != nil {
 			log.Printf("usage_ticker: %s: LogEvent failed: %v", sb.ID, err)
 			continue
