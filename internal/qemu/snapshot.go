@@ -76,6 +76,20 @@ func (m *Manager) doHibernate(ctx context.Context, vm *VMInstance, checkpointSto
 	// failure → kernel panic loop). Bubble the error up so the API caller
 	// gets a clear refusal instead of a silently-corrupted sandbox.
 	if vm.agent != nil {
+		// Tear down any FUSE mounts before savevm so the snapshot doesn't
+		// capture broken file descriptors / hung kernel threads waiting on a
+		// FUSE daemon that won't exist on wake. Best-effort and idempotent:
+		// fusermount3 -u -a is a no-op when there are no FUSE mounts, and the
+		// `|| true` belt-and-braces means a partial failure can't block
+		// hibernate. v1 does not auto-restore mounts on wake; callers re-issue.
+		umountCtx, umountCancel := context.WithTimeout(ctx, 5*time.Second)
+		_, _ = vm.agent.Exec(umountCtx, &pb.ExecRequest{
+			Command:   "/bin/sh",
+			Args:      []string{"-c", "fusermount3 -u -a 2>/dev/null || true"},
+			RunAsRoot: true,
+		})
+		umountCancel()
+
 		if err := quiesceAndCloseAgent(ctx, vm.agent); err != nil {
 			log.Printf("qemu: hibernate %s: refusing savevm — %v", vm.ID, err)
 			return nil, fmt.Errorf("hibernate %s: %w", vm.ID, err)

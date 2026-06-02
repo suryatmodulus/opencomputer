@@ -12,6 +12,7 @@ from opencomputer.agent import Agent
 from opencomputer.exec import Exec
 from opencomputer.filesystem import Filesystem
 from opencomputer.image import Image
+from opencomputer.mounts import Mounts
 from opencomputer.pty import Pty
 from opencomputer.sse import parse_sse_stream
 
@@ -513,6 +514,11 @@ class Sandbox:
     def files(self) -> Filesystem:
         """Access filesystem operations."""
         return Filesystem(self._ops_client, self.sandbox_id)
+
+    @property
+    def mounts(self) -> Mounts:
+        """Mount remote filesystems (S3, GCS, SFTP, …) via rclone+FUSE."""
+        return Mounts(self._ops_client, self.sandbox_id)
 
     @property
     def exec(self) -> Exec:

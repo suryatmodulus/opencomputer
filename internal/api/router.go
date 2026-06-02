@@ -59,6 +59,7 @@ type Server struct {
 	sandboxDomain   string                            // base domain for sandbox subdomains
 	cfClient        *cloudflare.Client                // nil if Cloudflare not configured
 	pendingCreates  sync.Map                          // map[sandboxID]*pendingCreate — async sandbox creation tracking
+	mounts          *mountRegistry                    // process-local FUSE mount tracker; cleared on hibernate
 	sandboxAPIProxy *proxy.SandboxAPIProxy            // nil except in server mode (proxies data-plane to workers)
 	stripeClient    *billing.StripeClient              // nil if Stripe not configured
 	redisClient     *redis.Client                     // nil if Redis not configured (for health checks)
@@ -134,6 +135,7 @@ func NewServer(mgr sandbox.Manager, ptyMgr *sandbox.PTYManager, apiKey string, o
 		echo:       e,
 		manager:    mgr,
 		ptyManager: ptyMgr,
+		mounts:     newMountRegistry(),
 	}
 
 	if opts != nil {
@@ -458,6 +460,11 @@ func NewServer(mgr sandbox.Manager, ptyMgr *sandbox.PTYManager, apiKey string, o
 		api.POST("/sandboxes/:id/files/mkdir", pxy)
 		api.DELETE("/sandboxes/:id/files", pxy)
 
+		// Mounts (FUSE)
+		api.POST("/sandboxes/:id/mounts", pxy)
+		api.GET("/sandboxes/:id/mounts", pxy)
+		api.DELETE("/sandboxes/:id/mounts", pxy)
+
 		// PTY
 		api.POST("/sandboxes/:id/pty", pxy)
 		api.GET("/sandboxes/:id/pty/:sessionID", pxy)
@@ -488,6 +495,10 @@ func NewServer(mgr sandbox.Manager, ptyMgr *sandbox.PTYManager, apiKey string, o
 		api.GET("/sandboxes/:id/files/list", s.listDir)
 		api.POST("/sandboxes/:id/files/mkdir", s.makeDir)
 		api.DELETE("/sandboxes/:id/files", s.removeFile)
+
+		api.POST("/sandboxes/:id/mounts", s.addMount)
+		api.GET("/sandboxes/:id/mounts", s.listMounts)
+		api.DELETE("/sandboxes/:id/mounts", s.removeMount)
 
 		api.POST("/sandboxes/:id/pty", s.createPTY)
 		api.GET("/sandboxes/:id/pty/:sessionID", s.ptyWebSocket)

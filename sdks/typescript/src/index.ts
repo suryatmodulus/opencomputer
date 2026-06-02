@@ -15,6 +15,7 @@ export {
 export { Agent, type AgentEvent, type AgentConfig, type AgentStartOpts, type AgentSession, type McpServerConfig } from "./agent.js";
 export { Filesystem, type EntryInfo } from "./filesystem.js";
 export { Exec, type ProcessResult, type RunOpts, type ExecSession, type ExecSessionInfo, type ExecStartOpts, type ExecAttachOpts } from "./exec.js";
+export { Mounts, type AddMountOpts, type MountInfo, type MountBackend } from "./mounts.js";
 export { type Shell, type ShellOpts, type ShellRunOpts, ShellBusyError, ShellClosedError } from "./shell.js";
 export { Pty, type PtySession, type PtyOpts } from "./pty.js";
 export { Templates, type TemplateInfo } from "./template.js";

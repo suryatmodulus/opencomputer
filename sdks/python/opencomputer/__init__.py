@@ -5,6 +5,7 @@ from opencomputer.agent import Agent, AgentEvent, AgentSession, AgentSessionInfo
 from opencomputer.filesystem import Filesystem
 from opencomputer.exec import Exec, ProcessResult, ExecSession, ExecSessionInfo
 from opencomputer.image import Image
+from opencomputer.mounts import Mounts, MountInfo
 from opencomputer.pty import Pty, PtySession
 from opencomputer.shell import Shell, ShellBusyError, ShellClosedError
 from opencomputer.template import Template
@@ -39,6 +40,8 @@ __all__ = [
     "ExecSession",
     "ExecSessionInfo",
     "Image",
+    "Mounts",
+    "MountInfo",
     "Pty",
     "PtySession",
     "Shell",

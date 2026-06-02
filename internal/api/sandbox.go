@@ -1667,6 +1667,13 @@ func (s *Server) hibernateSandbox(c echo.Context) error {
 		})
 	}
 
+	// FUSE mounts are torn down by the hibernate path (snapshot.go runs
+	// `fusermount3 -u -a`) and v1 doesn't auto-restore them on wake — clear
+	// the registry so list() reflects reality post-wake.
+	if s.mounts != nil {
+		s.mounts.clear(id)
+	}
+
 	// Mark hibernated in sandbox router
 	if s.router != nil {
 		timeout := 600 // default for explicit hibernate
