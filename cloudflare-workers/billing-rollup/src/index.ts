@@ -33,6 +33,14 @@ export interface Env {
   SHADOW?: string;
   BUCKET_SECONDS?: string; // default 3600 (hourly)
   GRACE_SECONDS?: string;  // default 600 — watermark so late samples settle
+  // Cutover boundary (unix seconds). Buckets that START before this are
+  // consumed (samples marked rolled_up) but emit NO meter events — the cell
+  // bills everything before the boundary, the edge bills from it. Unset/0 =
+  // bill everything (steady state). Set it to the chosen handoff time T at
+  // cutover so the edge and cell hand off at a bucket boundary with no overlap
+  // (double-bill) and no gap (under-bill). Also cleanly drops late stragglers
+  // below T, which the cell already billed.
+  BILL_FROM?: string;
 }
 
 const BUCKET_SECONDS_DEFAULT = 3600;
@@ -41,6 +49,10 @@ const SEND_LIMIT = 500;
 
 function isShadow(env: Env): boolean {
   return env.SHADOW !== "false";
+}
+function billFromSeconds(env: Env): number {
+  const t = Number.parseInt(env.BILL_FROM ?? "", 10);
+  return Number.isFinite(t) && t > 0 ? t : 0;
 }
 function bucketSeconds(env: Env): number {
   return Number.parseInt(env.BUCKET_SECONDS ?? "", 10) || BUCKET_SECONDS_DEFAULT;
@@ -97,7 +109,13 @@ export default {
       const nowMs = Date.now();
       const roll = await runRollup(env, nowMs);
       const send = isShadow(env) ? null : await sendPending(env, nowMs);
-      return json({ ok: true, shadow: isShadow(env), roll, send });
+      return json({
+        ok: true,
+        shadow: isShadow(env),
+        cfg: { billFrom: billFromSeconds(env), bucketSec: bucketSeconds(env), grace: graceSeconds(env), nowSec: Math.floor(nowMs / 1000) },
+        roll,
+        send,
+      });
     }
     return new Response("not found", { status: 404 });
   },
@@ -149,6 +167,21 @@ async function rollBucket(
   const bucketEnd = bucketStart + bucketSec;
   const startMs = bucketStart * 1000;
   const endMs = bucketEnd * 1000;
+
+  // Cutover boundary: buckets that start before BILL_FROM belong to the cell
+  // (it bills everything up to the handoff). Consume the samples (mark them
+  // rolled so they don't pile up) but emit NO meter events — that's what makes
+  // the edge↔cell handoff at T overlap-free (no double-bill) and gap-free, and
+  // it absorbs late stragglers below T (already billed by the cell).
+  const billFrom = billFromSeconds(env);
+  if (billFrom > 0 && bucketStart < billFrom) {
+    const res = await env.OPENCOMPUTER_DB.prepare(
+      `UPDATE usage_samples SET rolled_up = 1 WHERE rolled_up = 0 AND ts >= ?1 AND ts < ?2`,
+    )
+      .bind(startMs, endMs)
+      .run();
+    return { meterRows: 0, samplesRolled: res.meta?.changes ?? 0 };
+  }
 
   // Aggregate unrolled samples in the bucket by (org, tier). We carry both
   // seconds (legacy per-tier unit) and memory_mb·seconds (→ GB-seconds for

@@ -32,6 +32,9 @@ WORKER_ENV = "dev"
 SHADOW = "true"
 BUCKET_SECONDS = "3600"
 GRACE_SECONDS = "600"
+# BILL_FROM unset = steady state (bill all closed buckets). At cutover, set it
+# to the chosen handoff boundary T (unix seconds) so the edge bills only from T
+# while the cell drains everything before it.
 
 [[tail_consumers]]
 service = "opensandbox-log-tail"
