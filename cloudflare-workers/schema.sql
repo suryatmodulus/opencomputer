@@ -235,6 +235,19 @@ CREATE TABLE IF NOT EXISTS usage_meter_events (
 CREATE INDEX IF NOT EXISTS idx_meter_events_pending ON usage_meter_events(state, bucket_start) WHERE state = 'pending';
 CREATE INDEX IF NOT EXISTS idx_meter_events_org_bucket ON usage_meter_events(org_id, bucket_start);
 
+-- Stripe price catalog — the resolved metered Price IDs the edge attaches when
+-- it provisions a pro subscription. The catalog is GLOBAL (one Stripe account,
+-- same prices for every cell), so it's written by a single deploy-time step
+-- (cmd/ensure-products), NOT by per-cell publishing — 40 cells must not each
+-- race to write it. The edge reads every row and attaches each price_id as a
+-- subscription item (mirrors the CP's CreateSubscription).
+--   key: "tier_1024".."tier_65536" | "overage" | "reserved" | "disk_overage"
+CREATE TABLE IF NOT EXISTS billing_prices (
+  key        TEXT PRIMARY KEY,
+  price_id   TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS org_subscription_items (
   org_id          TEXT NOT NULL,
   tier            TEXT NOT NULL,                  -- e.g. "memory" | "cpu"
