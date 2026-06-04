@@ -76,6 +76,15 @@ func (m *Manager) doHibernate(ctx context.Context, vm *VMInstance, checkpointSto
 	// failure → kernel panic loop). Bubble the error up so the API caller
 	// gets a clear refusal instead of a silently-corrupted sandbox.
 	if vm.agent != nil {
+		// FUSE mounts intentionally are NOT torn down before savevm —
+		// loadvm restores them along with the rest of VM memory (including
+		// the rclone daemons), so mounts naturally survive hibernate/wake.
+		// Two earlier attempts at pre-savevm teardown both wedged the wake
+		// path: `pkill -KILL rclone` captured zombie state that loadvm
+		// couldn't recover; `fusermount3 -u -z` alone left the in-VM agent
+		// unreachable post-loadvm. The "mounts come back on wake" behavior
+		// turned out to be the right product semantics anyway — callers can
+		// explicitly `mounts.remove` when they want a mount gone.
 		if err := quiesceAndCloseAgent(ctx, vm.agent); err != nil {
 			log.Printf("qemu: hibernate %s: refusing savevm — %v", vm.ID, err)
 			return nil, fmt.Errorf("hibernate %s: %w", vm.ID, err)

@@ -32,6 +32,11 @@ account_id = "1241f114453e32d292197e3fb36210b2"
 # ordered 2026-05-18 for *.sb.opensandbox.ai + sb.opensandbox.ai.
 routes = [
   { pattern = "*.sb.opensandbox.ai/*", zone_name = "opensandbox.ai" },
+  # Pinned so `wrangler delete && wrangler deploy` (the branch-swap reset
+  # workflow) always re-attaches this hostname. custom_domain=true tells CF to
+  # manage the DNS record + SSL cert automatically — different from a plain
+  # worker route, which would need a separate DNS entry that survives delete.
+  { pattern = "app2.opensandbox.ai", zone_name = "opensandbox.ai", custom_domain = true },
 ]
 
 # Static assets — the dashboard SPA. Built from `web/` by the deploy script
@@ -68,18 +73,10 @@ script_name = "opensandbox-edge-dev"
 tag = "v1"
 new_sqlite_classes = ["CreditAccount"]
 
-# v2 was applied to the deployed dev worker out-of-band (it created a
-# SandboxWsGateway DO from a branch never merged here). Placeholder so the
-# ledger is contiguous and wrangler can append v3.
-[[migrations]]
-tag = "v2"
-
-# This branch doesn't define SandboxWsGateway. Delete the orphaned class +
-# its DOs so this branch can deploy (CF blocks dropping a depended-on class
-# without an explicit delete-class migration). CreditAccount is untouched.
-[[migrations]]
-tag = "v3"
-deleted_classes = ["SandboxWsGateway"]
+# v2 / v3 reconciliation entries were dropped after a clean `wrangler delete`
+# reset the migration ledger to v1. If you ever apply a DO change out-of-band
+# again, re-add the placeholder pattern (see git log for the old comments) or
+# just `wrangler delete --force` to reset.
 
 # Secrets (set via `wrangler secret put`):
 #   SESSION_JWT_SECRET     — HMAC for session JWT (shared with all CPs in cell fleet)

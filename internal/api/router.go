@@ -24,6 +24,7 @@ import (
 	"github.com/opensandbox/opensandbox/internal/db"
 	"github.com/opensandbox/opensandbox/internal/edgeclient"
 	"github.com/opensandbox/opensandbox/internal/metrics"
+	"github.com/opensandbox/opensandbox/internal/mounts"
 	"github.com/opensandbox/opensandbox/internal/observability"
 	"github.com/opensandbox/opensandbox/internal/obslog"
 	"github.com/opensandbox/opensandbox/internal/proxy"
@@ -60,6 +61,7 @@ type Server struct {
 	sandboxDomain   string                            // base domain for sandbox subdomains
 	cfClient        *cloudflare.Client                // nil if Cloudflare not configured
 	pendingCreates  sync.Map                          // map[sandboxID]*pendingCreate — async sandbox creation tracking
+	mountSvc        *mounts.Service                   // shared with worker.HTTPServer; nil disables the mounts API
 	sandboxAPIProxy *proxy.SandboxAPIProxy            // nil except in server mode (proxies data-plane to workers)
 	stripeClient    *billing.StripeClient              // nil if Stripe not configured
 	redisClient     *redis.Client                     // nil if Redis not configured (for health checks)
@@ -136,6 +138,12 @@ func NewServer(mgr sandbox.Manager, ptyMgr *sandbox.PTYManager, apiKey string, o
 		echo:       e,
 		manager:    mgr,
 		ptyManager: ptyMgr,
+	}
+	// Mount service is only useful in combined mode (this process owns the
+	// sandbox manager). In server mode the CP proxies to a worker, which
+	// instantiates its own mounts.Service backed by its own manager.
+	if mgr != nil {
+		s.mountSvc = mounts.NewService(mgr)
 	}
 
 	if opts != nil {
@@ -461,6 +469,11 @@ func NewServer(mgr sandbox.Manager, ptyMgr *sandbox.PTYManager, apiKey string, o
 		api.POST("/sandboxes/:id/files/mkdir", pxy)
 		api.DELETE("/sandboxes/:id/files", pxy)
 
+		// Mounts (FUSE)
+		api.POST("/sandboxes/:id/mounts", pxy)
+		api.GET("/sandboxes/:id/mounts", pxy)
+		api.DELETE("/sandboxes/:id/mounts", pxy)
+
 		// PTY
 		api.POST("/sandboxes/:id/pty", pxy)
 		api.GET("/sandboxes/:id/pty/:sessionID", pxy)
@@ -491,6 +504,10 @@ func NewServer(mgr sandbox.Manager, ptyMgr *sandbox.PTYManager, apiKey string, o
 		api.GET("/sandboxes/:id/files/list", s.listDir)
 		api.POST("/sandboxes/:id/files/mkdir", s.makeDir)
 		api.DELETE("/sandboxes/:id/files", s.removeFile)
+
+		api.POST("/sandboxes/:id/mounts", s.addMount)
+		api.GET("/sandboxes/:id/mounts", s.listMounts)
+		api.DELETE("/sandboxes/:id/mounts", s.removeMount)
 
 		api.POST("/sandboxes/:id/pty", s.createPTY)
 		api.GET("/sandboxes/:id/pty/:sessionID", s.ptyWebSocket)

@@ -6,6 +6,7 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	"github.com/opensandbox/opensandbox/internal/auth"
+	"github.com/opensandbox/opensandbox/internal/mounts"
 	"github.com/opensandbox/opensandbox/internal/observability"
 	"github.com/opensandbox/opensandbox/internal/obslog"
 	"github.com/opensandbox/opensandbox/internal/proxy"
@@ -22,6 +23,7 @@ type HTTPServer struct {
 	jwtIssuer          *auth.JWTIssuer
 	sandboxDBs         *sandbox.SandboxDBManager
 	router             *sandbox.SandboxRouter
+	mountSvc           *mounts.Service // nil when store is unavailable
 	sandboxDomain      string
 }
 
@@ -40,6 +42,9 @@ func NewHTTPServer(mgr sandbox.Manager, ptyMgr *sandbox.PTYManager, execMgr *san
 		sandboxDBs:         sandboxDBs,
 		router:             sbRouter,
 		sandboxDomain:      sandboxDomain,
+	}
+	if mgr != nil {
+		s.mountSvc = mounts.NewService(mgr)
 	}
 
 	// Global middleware. Sentry goes first so it can observe panics and
@@ -87,6 +92,11 @@ func NewHTTPServer(mgr sandbox.Manager, ptyMgr *sandbox.PTYManager, execMgr *san
 	api.GET("/sandboxes/:id/files/list", s.listDir)
 	api.POST("/sandboxes/:id/files/mkdir", s.makeDir)
 	api.DELETE("/sandboxes/:id/files", s.removeFile)
+
+	// Mounts (FUSE via rclone)
+	api.POST("/sandboxes/:id/mounts", s.addMount)
+	api.GET("/sandboxes/:id/mounts", s.listMounts)
+	api.DELETE("/sandboxes/:id/mounts", s.removeMount)
 
 	// Token refresh
 	api.POST("/sandboxes/:id/token/refresh", s.refreshToken)

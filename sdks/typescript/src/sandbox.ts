@@ -1,6 +1,7 @@
 import { Agent } from "./agent.js";
 import { Filesystem } from "./filesystem.js";
 import { Exec } from "./exec.js";
+import { Mounts } from "./mounts.js";
 import { Pty } from "./pty.js";
 import { Image } from "./image.js";
 import { parseSSEStream } from "./sse.js";
@@ -190,6 +191,7 @@ export class Sandbox {
   readonly agent: Agent;
   readonly files: Filesystem;
   readonly exec: Exec;
+  readonly mounts: Mounts;
   readonly pty: Pty;
   /** @deprecated Use `sandbox.exec` instead. This alias exists for backwards compatibility. */
   readonly commands: Exec;
@@ -215,6 +217,7 @@ export class Sandbox {
     this.files = new Filesystem(apiUrl, apiKey, this.sandboxId, "");
     this.exec = new Exec(apiUrl, apiKey, this.sandboxId, "");
     this.commands = this.exec; // backwards-compatible alias
+    this.mounts = new Mounts(apiUrl, apiKey, this.sandboxId, "");
     this.pty = new Pty(apiUrl, apiKey, this.sandboxId, "");
   }
 
@@ -368,6 +371,7 @@ export class Sandbox {
     (this as any).agent = new Agent(this.apiUrl, this.apiKey, this.sandboxId, "");
     (this as any).files = new Filesystem(this.apiUrl, this.apiKey, this.sandboxId, "");
     (this as any).exec = new Exec(this.apiUrl, this.apiKey, this.sandboxId, "");
+    (this as any).mounts = new Mounts(this.apiUrl, this.apiKey, this.sandboxId, "");
     (this as any).pty = new Pty(this.apiUrl, this.apiKey, this.sandboxId, "");
   }
 
@@ -635,6 +639,7 @@ export class Sandbox {
     (this as any).agent = new Agent(this.apiUrl, this.apiKey, this.sandboxId, "");
     (this as any).files = new Filesystem(this.apiUrl, this.apiKey, this.sandboxId, "");
     (this as any).exec = new Exec(this.apiUrl, this.apiKey, this.sandboxId, "");
+    (this as any).mounts = new Mounts(this.apiUrl, this.apiKey, this.sandboxId, "");
     (this as any).pty = new Pty(this.apiUrl, this.apiKey, this.sandboxId, "");
   }
 
