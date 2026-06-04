@@ -3,6 +3,13 @@ title: "Mounts"
 description: "Mount S3, GCS, Azure Blob, SFTP, WebDAV, and Dropbox into a sandbox via FUSE"
 ---
 
+<Note>
+  **Preview:** the mounts API is new. Endpoints, request shape, and SDK
+  method names may change before GA. Backend coverage is rclone's — works
+  for the listed providers today; expect rough edges on less-tested
+  backends.
+</Note>
+
 Mount remote filesystems directly into your sandbox so your code reads and
 writes them like local files — no SDK calls, no chunked downloads, no
 boilerplate. Perfect for pulling in datasets, model weights, or a customer's
