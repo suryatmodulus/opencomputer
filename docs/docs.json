@@ -37,14 +37,7 @@
           "sandboxes/overview",
           "sandboxes/running-commands",
           "sandboxes/working-with-files",
-          {
-            "group": "Mounts",
-            "tag": "Preview",
-            "expanded": true,
-            "pages": [
-              "sandboxes/mounts"
-            ]
-          },
+          "sandboxes/mounts",
           "sandboxes/signed-urls",
           "sandboxes/interactive-terminals",
           "sandboxes/timeout",
