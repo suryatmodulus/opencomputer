@@ -345,8 +345,58 @@ export default {
         ];
       });
 
+    // Authoritative plan resolution. The envelope's `plan` is the worker's
+    // cell-local-PG view, which goes stale on upgrade/downgrade — plan changes
+    // globally via the edge, and no single cell has the complete picture. D1
+    // orgs.plan is the source of truth and we're already on the edge with D1 in
+    // hand, so resolve it here and route by it. Without this, a free→pro upgrade
+    // leaks usage: stale 'free' ticks hit the DO (a no-op for a now-pro org) and
+    // never get sampled. Falls back to the (stale) envelope plan ONLY if the D1
+    // lookup itself fails — degraded, but no worse than trusting it outright.
+    const tickOrgIds = [
+      ...new Set(fresh.filter((e) => e.type === "usage_tick" && e.org_id).map((e) => e.org_id as string)),
+    ];
+    const planLookup = await resolvePlans(env, tickOrgIds);
+    const planFor = (e: SandboxEventEnvelope): string | undefined =>
+      planLookup.ok ? (e.org_id ? planLookup.byOrg.get(e.org_id) : undefined) : e.plan;
+
+    // Pro-tier usage samples: land each pro `usage_tick`'s resource dimensions
+    // into usage_samples for the rollup cron (the edge analog of the cell's
+    // sandbox_scale_events → billable_events path). Free orgs are debited via
+    // the DO fan-out below and need no sample row. id is the event UUID so the
+    // ON CONFLICT(id) DO NOTHING dedup matches the events table — the forwarder
+    // is at-least-once and additive billing must not double-count on replay.
+    //
+    // This goes in the main batch (not waitUntil) on purpose: unlike the
+    // cross-DO debit fan-out, it's a local D1 write, so it should share the
+    // batch's retry-on-failure guarantee (503 → CP forwarder keeps the PEL).
+    const usageSampleInsert = env.OPENCOMPUTER_DB.prepare(
+      `INSERT INTO usage_samples (id, org_id, sandbox_id, memory_mb, cpu_count, interval_s, ts, cell_id)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+       ON CONFLICT(id) DO NOTHING`,
+    );
+    const usageSampleBatches = fresh
+      .filter((e) => e.type === "usage_tick" && planFor(e) === "pro" && e.org_id && e.sandbox_id)
+      .map((e) => {
+        const p = (e.payload ?? {}) as {
+          memory_mb?: number;
+          cpu_count?: number;
+          interval_s?: number;
+        };
+        return usageSampleInsert.bind(
+          e.id,
+          e.org_id,
+          e.sandbox_id,
+          p.memory_mb ?? 0,
+          p.cpu_count ?? 0,
+          p.interval_s ?? 0,
+          Date.parse(e.timestamp) || Date.now(),
+          e.cell_id,
+        );
+      });
+
     try {
-      await env.OPENCOMPUTER_DB.batch([...batches, ...capacityBatches, ...lifecycleBatches, ...checkpointBatches, ...imageBatches]);
+      await env.OPENCOMPUTER_DB.batch([...batches, ...capacityBatches, ...lifecycleBatches, ...checkpointBatches, ...imageBatches, ...usageSampleBatches]);
     } catch (err) {
       // Database errors are retryable — return 5xx so the CP forwarder
       // leaves the batch in the PEL.
@@ -374,9 +424,10 @@ export default {
     //
     // Pro orgs are filtered here (cheap) rather than in the DO so we avoid
     // even allocating the DO stub for orgs that don't need debit accounting.
-    // Events without plan="free" are silently skipped — the CP forwarder
-    // populates `plan` from PG at emit time.
-    const debitTargets = fresh.filter((e) => e.type === "usage_tick" && e.plan === "free" && e.org_id);
+    // Plan comes from the authoritative D1 lookup (planFor), not the stale
+    // envelope value — so a free→pro upgrade stops debiting immediately and a
+    // pro→free downgrade resumes it, with no dependency on cell-PG freshness.
+    const debitTargets = fresh.filter((e) => e.type === "usage_tick" && planFor(e) === "free" && e.org_id);
     if (debitTargets.length > 0) {
       ctx.waitUntil(fanoutDebits(env, debitTargets));
     }
@@ -413,6 +464,32 @@ async function fanoutDebits(env: Env, events: SandboxEventEnvelope[]): Promise<v
       }
     }),
   );
+}
+
+// resolvePlans fetches the authoritative plan for each org from D1 orgs.plan
+// (the global source of truth) in one batched query. Returns ok=false if the
+// lookup fails, signalling callers to fall back to the envelope plan rather
+// than dropping billing entirely. Orgs absent from D1 (new-org race) are simply
+// missing from the map → treated as unknown plan → skipped, the safe default.
+async function resolvePlans(
+  env: Env,
+  orgIds: string[],
+): Promise<{ ok: boolean; byOrg: Map<string, string> }> {
+  const byOrg = new Map<string, string>();
+  if (orgIds.length === 0) return { ok: true, byOrg };
+  const placeholders = orgIds.map((_, i) => `?${i + 1}`).join(",");
+  try {
+    const res = await env.OPENCOMPUTER_DB.prepare(
+      `SELECT id, plan FROM orgs WHERE id IN (${placeholders})`,
+    )
+      .bind(...orgIds)
+      .all<{ id: string; plan: string }>();
+    for (const r of res.results ?? []) byOrg.set(r.id, r.plan);
+    return { ok: true, byOrg };
+  } catch (err) {
+    console.error("events-ingest: org plan lookup failed — falling back to envelope plan", err);
+    return { ok: false, byOrg };
+  }
 }
 
 function jsonResponse(body: unknown, status = 200): Response {
