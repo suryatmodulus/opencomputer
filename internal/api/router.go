@@ -24,6 +24,7 @@ import (
 	"github.com/opensandbox/opensandbox/internal/db"
 	"github.com/opensandbox/opensandbox/internal/edgeclient"
 	"github.com/opensandbox/opensandbox/internal/metrics"
+	"github.com/opensandbox/opensandbox/internal/mounts"
 	"github.com/opensandbox/opensandbox/internal/observability"
 	"github.com/opensandbox/opensandbox/internal/obslog"
 	"github.com/opensandbox/opensandbox/internal/proxy"
@@ -59,7 +60,7 @@ type Server struct {
 	sandboxDomain   string                            // base domain for sandbox subdomains
 	cfClient        *cloudflare.Client                // nil if Cloudflare not configured
 	pendingCreates  sync.Map                          // map[sandboxID]*pendingCreate — async sandbox creation tracking
-	mounts          *mountRegistry                    // process-local FUSE mount tracker; cleared on hibernate
+	mountSvc        *mounts.Service                   // shared with worker.HTTPServer; nil disables the mounts API
 	sandboxAPIProxy *proxy.SandboxAPIProxy            // nil except in server mode (proxies data-plane to workers)
 	stripeClient    *billing.StripeClient              // nil if Stripe not configured
 	redisClient     *redis.Client                     // nil if Redis not configured (for health checks)
@@ -135,7 +136,14 @@ func NewServer(mgr sandbox.Manager, ptyMgr *sandbox.PTYManager, apiKey string, o
 		echo:       e,
 		manager:    mgr,
 		ptyManager: ptyMgr,
-		mounts:     newMountRegistry(),
+	}
+	// Mount service is only useful in combined mode (this process owns the
+	// sandbox manager). In server mode the CP proxies to a worker, which
+	// instantiates its own mounts.Service backed by its own manager.
+	if mgr != nil {
+		// Store is nil until opts is processed below; the persistent-mount
+		// path will return ErrPersistenceUnavailable if it's missing then.
+		s.mountSvc = mounts.NewService(mgr, nil)
 	}
 
 	if opts != nil {
@@ -154,6 +162,21 @@ func NewServer(mgr sandbox.Manager, ptyMgr *sandbox.PTYManager, apiKey string, o
 		s.execSessionManager = opts.ExecSessionManager
 		s.sandboxDBs = opts.SandboxDBs
 		s.router = opts.Router
+		// Now that we have the store, upgrade the mount service so persistent
+		// mounts work. The earlier NewService(mgr, nil) was a placeholder for
+		// the no-store case.
+		if mgr != nil && s.store != nil {
+			s.mountSvc = mounts.NewService(mgr, s.store)
+		}
+		// Wire the post-auto-wake hook so persistent FUSE mounts are replayed
+		// when the router auto-wakes a hibernated sandbox on an incoming request.
+		// Explicit-wake API callers (POST /sandboxes/:id/wake) hit a separate
+		// path; that handler triggers replay directly.
+		if s.router != nil && s.mountSvc != nil {
+			s.router.SetOnWake(func(sandboxID string) {
+				s.mountSvc.OnWake(context.Background(), sandboxID)
+			})
+		}
 		s.workerRegistry = opts.WorkerRegistry
 		s.checkpointStore = opts.CheckpointStore
 		s.sandboxDomain = opts.SandboxDomain

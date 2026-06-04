@@ -1,4 +1,4 @@
-package api
+package mounts
 
 import (
 	"strings"
@@ -7,7 +7,7 @@ import (
 
 func TestRenderRcloneConfig_RawPassthrough(t *testing.T) {
 	raw := "[whatever]\ntype = s3\nfoo = bar\n"
-	got, err := renderRcloneConfig(addMountRequest{
+	got, err := renderRcloneConfig(AddRequest{
 		Remote:       "whatever:bucket",
 		RcloneConfig: raw,
 	})
@@ -20,7 +20,7 @@ func TestRenderRcloneConfig_RawPassthrough(t *testing.T) {
 }
 
 func TestRenderRcloneConfig_S3DefaultsAWSProvider(t *testing.T) {
-	got, err := renderRcloneConfig(addMountRequest{
+	got, err := renderRcloneConfig(AddRequest{
 		Remote:  "s3:my-bucket",
 		Backend: "s3",
 		Creds: map[string]string{
@@ -54,7 +54,7 @@ func TestRenderRcloneConfig_S3DefaultsAWSProvider(t *testing.T) {
 }
 
 func TestRenderRcloneConfig_S3UserProviderWins(t *testing.T) {
-	got, err := renderRcloneConfig(addMountRequest{
+	got, err := renderRcloneConfig(AddRequest{
 		Remote:  "minio:bucket",
 		Backend: "s3",
 		Creds: map[string]string{
@@ -76,7 +76,7 @@ func TestRenderRcloneConfig_S3UserProviderWins(t *testing.T) {
 }
 
 func TestRenderRcloneConfig_GCSHasTypeWithSpace(t *testing.T) {
-	got, err := renderRcloneConfig(addMountRequest{
+	got, err := renderRcloneConfig(AddRequest{
 		Remote:  "gcs:my-bucket",
 		Backend: "gcs",
 		Creds:   map[string]string{"service_account_credentials": "{\"type\":\"service_account\"}"},
@@ -92,8 +92,8 @@ func TestRenderRcloneConfig_GCSHasTypeWithSpace(t *testing.T) {
 
 func TestRenderRcloneConfig_DeterministicKeyOrder(t *testing.T) {
 	creds := map[string]string{"zeta": "z", "alpha": "a", "mu": "m"}
-	a, _ := renderRcloneConfig(addMountRequest{Remote: "sftp:host", Backend: "sftp", Creds: creds})
-	b, _ := renderRcloneConfig(addMountRequest{Remote: "sftp:host", Backend: "sftp", Creds: creds})
+	a, _ := renderRcloneConfig(AddRequest{Remote: "sftp:host", Backend: "sftp", Creds: creds})
+	b, _ := renderRcloneConfig(AddRequest{Remote: "sftp:host", Backend: "sftp", Creds: creds})
 	if a != b {
 		t.Errorf("repeated render produced different output:\nA:\n%s\nB:\n%s", a, b)
 	}
@@ -107,14 +107,14 @@ func TestRenderRcloneConfig_DeterministicKeyOrder(t *testing.T) {
 }
 
 func TestRenderRcloneConfig_RejectsBareRemote(t *testing.T) {
-	_, err := renderRcloneConfig(addMountRequest{Remote: "no-colon-here", Backend: "s3"})
+	_, err := renderRcloneConfig(AddRequest{Remote: "no-colon-here", Backend: "s3"})
 	if err == nil {
 		t.Fatal("expected error for remote without colon, got nil")
 	}
 }
 
 func TestRenderRcloneConfig_RejectsUnknownBackend(t *testing.T) {
-	_, err := renderRcloneConfig(addMountRequest{Remote: "x:y", Backend: "minio-direct"})
+	_, err := renderRcloneConfig(AddRequest{Remote: "x:y", Backend: "minio-direct"})
 	if err == nil {
 		t.Fatal("expected error for unknown backend, got nil")
 	}
@@ -124,7 +124,7 @@ func TestRenderRcloneConfig_RejectsUnknownBackend(t *testing.T) {
 }
 
 func TestRenderRcloneConfig_RequiresBackendOrRawConfig(t *testing.T) {
-	_, err := renderRcloneConfig(addMountRequest{Remote: "x:y"})
+	_, err := renderRcloneConfig(AddRequest{Remote: "x:y"})
 	if err == nil {
 		t.Fatal("expected error when no backend and no rcloneConfig, got nil")
 	}
@@ -150,8 +150,69 @@ func TestMountConfPath_DeterministicAndSafe(t *testing.T) {
 	}
 }
 
+func TestRemoteFromConfig(t *testing.T) {
+	cases := []struct {
+		name string
+		conf string
+		want string
+	}{
+		{"single section", "[s3]\ntype = s3\n", "s3"},
+		{"leading whitespace", "  [gcs]  \ntype = google cloud storage\n", "gcs"},
+		{"comment first then section", "# header comment\n[box]\ntype = box\n", "box"},
+		{"empty config", "", ""},
+		{"no section header", "type = s3\naccess_key_id = x\n", ""},
+		{"first section wins", "[a]\ntype = s3\n[b]\ntype = sftp\n", "a"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := remoteFromConfig(tc.conf); got != tc.want {
+				t.Errorf("remoteFromConfig(%q) = %q, want %q", tc.conf, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMountRegistry_ClearNonPersistent(t *testing.T) {
+	r := newRegistry()
+	// Mix of persistent + non-persistent for the same sandbox.
+	r.put("sb-1", MountRecord{Path: "/mnt/ephemeral", Remote: "s3:eph", Status: "active"})
+	r.put("sb-1", MountRecord{Path: "/mnt/durable", Remote: "s3:dur", Persistent: true, Status: "active"})
+	r.put("sb-1", MountRecord{Path: "/mnt/durable2", Remote: "s3:dur2", Persistent: true, Status: "active"})
+	r.put("sb-2", MountRecord{Path: "/mnt/x", Remote: "s3:x", Status: "active"})
+
+	r.clearNonPersistent("sb-1")
+
+	got := r.get("sb-1")
+	if len(got) != 2 {
+		t.Fatalf("expected 2 persistent entries to remain on sb-1, got %d: %v", len(got), got)
+	}
+	for _, rec := range got {
+		if !rec.Persistent {
+			t.Errorf("non-persistent record leaked through clearNonPersistent: %+v", rec)
+		}
+		if rec.Status != "replaying" {
+			t.Errorf("persistent record status after clearNonPersistent want %q got %q", "replaying", rec.Status)
+		}
+	}
+
+	// Other sandboxes untouched.
+	if got := r.get("sb-2"); len(got) != 1 {
+		t.Errorf("clearNonPersistent leaked into other sandbox: %v", got)
+	}
+}
+
+func TestMountRegistry_ClearNonPersistent_AllNonPersistent(t *testing.T) {
+	r := newRegistry()
+	r.put("sb-1", MountRecord{Path: "/mnt/a", Status: "active"})
+	r.put("sb-1", MountRecord{Path: "/mnt/b", Status: "active"})
+	r.clearNonPersistent("sb-1")
+	if got := r.get("sb-1"); got != nil {
+		t.Errorf("clearNonPersistent with no persistent entries should drop the sandbox; got %v", got)
+	}
+}
+
 func TestMountRegistry_PutListRemove(t *testing.T) {
-	r := newMountRegistry()
+	r := newRegistry()
 	r.put("sb-1", MountRecord{Path: "/mnt/a", Remote: "s3:a", Backend: "s3", ReadOnly: true})
 	r.put("sb-1", MountRecord{Path: "/mnt/b", Remote: "s3:b", Backend: "s3", ReadOnly: false})
 	r.put("sb-2", MountRecord{Path: "/mnt/x", Remote: "gcs:x", Backend: "gcs", ReadOnly: true})
@@ -193,9 +254,10 @@ func TestMountRegistry_PutListRemove(t *testing.T) {
 		t.Errorf("after removing last entry, expected nil, got %v", got)
 	}
 
-	// clear() drops a sandbox even with entries.
-	r.clear("sb-2")
+	// clearNonPersistent() drops all non-persistent entries (in this test, all
+	// of sb-2's entries are non-persistent).
+	r.clearNonPersistent("sb-2")
 	if got := r.get("sb-2"); got != nil {
-		t.Errorf("after clear, expected nil, got %v", got)
+		t.Errorf("after clearNonPersistent, expected nil, got %v", got)
 	}
 }

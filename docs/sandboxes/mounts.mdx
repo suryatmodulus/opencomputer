@@ -214,25 +214,80 @@ await sandbox.mounts.remove("/mnt/data");
 
 ## Hibernate behavior
 
-<Warning>
-  **Mounts do not survive hibernate.** When a sandbox hibernates (manually or
-  via idle timeout), all FUSE mounts are torn down before the snapshot is
-  taken — otherwise the snapshot would capture broken file descriptors that
-  hang processes on wake.
+By default, mounts do **not** survive hibernate. The mount is torn down in the
+VM before the snapshot is taken (otherwise the snapshot would capture broken
+file descriptors that hang processes on wake), and the server doesn't store
+your credentials anywhere — they live only in the VM's tmpfs for the lifetime
+of the mount.
 
-  v1 does not auto-restore mounts on wake. After waking, call `mounts.add()`
-  again for anything you need back. `mounts.list()` returns empty post-wake.
-</Warning>
+If you want the mount to come back automatically, opt in with `persistent: true`:
 
-The simplest pattern is to remount on wake:
+<CodeGroup>
+
+```typescript TypeScript
+await sandbox.mounts.add({
+  path: "/mnt/data",
+  remote: "s3:my-bucket",
+  backend: "s3",
+  creds: {...},
+  persistent: true,   // ← opt in
+});
+```
+
+```python Python
+await sandbox.mounts.add(
+    path="/mnt/data",
+    remote="s3:my-bucket",
+    backend="s3",
+    creds={...},
+    persistent=True,
+)
+```
+
+```bash CLI
+oc mounts add sb-abc123 \
+  --path /mnt/data --remote s3:my-bucket --backend s3 \
+  --cred access_key_id=... --cred secret_access_key=... \
+  --persistent
+```
+
+</CodeGroup>
+
+With `persistent: true`:
+
+- The rendered rclone config (which includes your creds) is encrypted with the
+  server's `OPENSANDBOX_SECRET_ENCRYPTION_KEY` and stored in PostgreSQL.
+- On wake — explicit (`sandbox.wake()`) or auto-wake (when any operation hits a
+  hibernated sandbox) — the server replays each persistent mount in the
+  background.
+- Wake completes immediately; mount replay doesn't block it. Inspect
+  `mounts.list()` to see the current state of each mount.
+
+### Wake-time failures
+
+If a persistent mount fails to replay (rotated creds, expired token, network
+issue, deleted bucket, etc.), **the wake still succeeds** — we don't punish
+your whole sandbox for one bad mount. The mount shows up in `list()` with the
+failure surfaced:
 
 ```typescript
-const sandbox = await Sandbox.connect("sb-abc123");
-if (sandbox.status === "hibernated") {
-  await sandbox.wake();
-  await sandbox.mounts.add({ path: "/mnt/data", remote: "s3:my-bucket", backend: "s3", creds });
-}
+const mounts = await sandbox.mounts.list();
+// [
+//   { path: "/mnt/data",  remote: "s3:my-bucket",   status: "active",   persistent: true },
+//   { path: "/mnt/stale", remote: "s3:old-bucket",  status: "failed",   persistent: true,
+//     error: "rclone mount failed (exit 1): AccessDenied: ..." },
+// ]
 ```
+
+To recover, either `remove()` the broken mount or `add()` it again with fresh
+creds (re-adding overwrites the prior spec).
+
+<Note>
+  `persistent: true` requires the server to have `OPENSANDBOX_SECRET_ENCRYPTION_KEY`
+  configured (the same key already used for project secrets). On self-hosted
+  setups without this key, `persistent: true` returns a clear 503 — fall back to
+  non-persistent mounts and remount after wake.
+</Note>
 
 ## CLI
 

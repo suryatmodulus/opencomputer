@@ -19,12 +19,21 @@ MountBackend = Literal["s3", "gcs", "azureblob", "sftp", "webdav", "dropbox"]
 
 @dataclass
 class MountInfo:
-    """An active mount as tracked by the worker."""
+    """An active mount as tracked by the worker.
+
+    ``status`` is one of ``"active"``, ``"replaying"``, or ``"failed"`` for
+    persistent mounts. Empty for non-persistent ones. ``error`` is set when
+    ``status == "failed"`` (typically a wake-time remount failure — bad creds,
+    expired tokens, network).
+    """
 
     path: str
     remote: str
     read_only: bool
     backend: str = ""
+    persistent: bool = False
+    status: str = ""
+    error: str = ""
 
 
 @dataclass
@@ -42,6 +51,7 @@ class Mounts:
         creds: dict[str, str] | None = None,
         rclone_config: str | None = None,
         read_only: bool = True,
+        persistent: bool = False,
         mount_options: list[str] | None = None,
     ) -> MountInfo:
         """Mount a remote filesystem at ``path`` inside the sandbox.
@@ -59,6 +69,12 @@ class Mounts:
                 advanced tuning.
             read_only: Default ``True``. Object-store FUSE mounts have
                 well-known write footguns; opt in to RW explicitly.
+            persistent: When ``True``, the encrypted rclone config is stored
+                server-side so the mount auto-restores on wake (both explicit
+                and idle-wake). Failed remounts surface in ``list()`` with
+                ``status="failed"`` instead of silently disappearing. Default
+                ``False``: non-persistent mounts vanish on hibernate and the
+                server never stores the credentials.
             mount_options: Extra args appended to ``rclone mount`` (e.g.
                 ``["--dir-cache-time", "1m"]``).
         """
@@ -66,6 +82,7 @@ class Mounts:
             "path": path,
             "remote": remote,
             "readOnly": read_only,
+            "persistent": persistent,
         }
         if backend is not None:
             body["backend"] = backend
@@ -81,12 +98,7 @@ class Mounts:
         )
         resp.raise_for_status()
         data = resp.json()
-        return MountInfo(
-            path=data["path"],
-            remote=data["remote"],
-            backend=data.get("backend", ""),
-            read_only=data.get("readOnly", True),
-        )
+        return _mount_from_dict(data)
 
     async def list(self) -> list[MountInfo]:
         """List the mounts this worker is tracking for the sandbox.
@@ -97,15 +109,7 @@ class Mounts:
         resp = await self._client.get(f"/sandboxes/{self._sandbox_id}/mounts")
         resp.raise_for_status()
         data = resp.json() or []
-        return [
-            MountInfo(
-                path=entry["path"],
-                remote=entry["remote"],
-                backend=entry.get("backend", ""),
-                read_only=entry.get("readOnly", True),
-            )
-            for entry in data
-        ]
+        return [_mount_from_dict(entry) for entry in data]
 
     async def remove(self, path: str) -> None:
         """Unmount a path previously passed to ``add()``. No-op if not mounted."""
@@ -118,3 +122,15 @@ class Mounts:
             resp.raise_for_status()
         except httpx.HTTPError:
             raise
+
+
+def _mount_from_dict(data: dict) -> MountInfo:
+    return MountInfo(
+        path=data["path"],
+        remote=data["remote"],
+        backend=data.get("backend", ""),
+        read_only=data.get("readOnly", True),
+        persistent=data.get("persistent", False),
+        status=data.get("status", ""),
+        error=data.get("error", ""),
+    )

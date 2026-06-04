@@ -1,4 +1,4 @@
-package api
+package worker
 
 import (
 	"context"
@@ -9,12 +9,14 @@ import (
 	"github.com/opensandbox/opensandbox/internal/mounts"
 )
 
-// MountRecord and the request body type live in internal/mounts. Re-exposed
-// here only so existing exported field names (used by SDKs) don't change.
+// HTTP handlers for the mounts API served directly from the worker. The
+// control-plane proxies /api/sandboxes/:id/mounts to here in server mode (and
+// in combined mode, the api.Server has its own handlers that hit the same
+// underlying mounts.Service shape). Behavior identical to the CP-side handlers.
 
-func (s *Server) addMount(c echo.Context) error {
+func (s *HTTPServer) addMount(c echo.Context) error {
 	if s.mountSvc == nil {
-		return c.JSON(http.StatusServiceUnavailable, errSandboxNotAvailable)
+		return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "mounts not available"})
 	}
 	id := c.Param("id")
 
@@ -39,16 +41,16 @@ func (s *Server) addMount(c echo.Context) error {
 	return c.JSON(http.StatusCreated, rec)
 }
 
-func (s *Server) listMounts(c echo.Context) error {
+func (s *HTTPServer) listMounts(c echo.Context) error {
 	if s.mountSvc == nil {
-		return c.JSON(http.StatusServiceUnavailable, errSandboxNotAvailable)
+		return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "mounts not available"})
 	}
 	return c.JSON(http.StatusOK, s.mountSvc.List(c.Param("id")))
 }
 
-func (s *Server) removeMount(c echo.Context) error {
+func (s *HTTPServer) removeMount(c echo.Context) error {
 	if s.mountSvc == nil {
-		return c.JSON(http.StatusServiceUnavailable, errSandboxNotAvailable)
+		return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "mounts not available"})
 	}
 	id := c.Param("id")
 	path := c.QueryParam("path")
@@ -62,7 +64,7 @@ func (s *Server) removeMount(c echo.Context) error {
 	return c.NoContent(http.StatusNoContent)
 }
 
-func (s *Server) routeOrCall(c echo.Context, sandboxID, opName string, op func(context.Context) error) error {
+func (s *HTTPServer) routeOrCall(c echo.Context, sandboxID, opName string, op func(context.Context) error) error {
 	if s.router != nil {
 		return s.router.Route(c.Request().Context(), sandboxID, opName, op)
 	}

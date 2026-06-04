@@ -22,6 +22,7 @@ import (
 	"github.com/opensandbox/opensandbox/internal/blobstore"
 	"github.com/opensandbox/opensandbox/internal/cellevents"
 	"github.com/opensandbox/opensandbox/internal/config"
+	"github.com/opensandbox/opensandbox/internal/crypto"
 	"github.com/opensandbox/opensandbox/internal/db"
 	"github.com/opensandbox/opensandbox/internal/metrics"
 	"github.com/opensandbox/opensandbox/internal/observability"
@@ -428,6 +429,16 @@ func main() {
 			defer store.Close()
 			log.Println("opensandbox-worker: PostgreSQL store connected (auto-wake enabled)")
 
+			// Wire the at-rest encryption key — same key the server uses, picked
+			// up from OPENSANDBOX_SECRET_ENCRYPTION_KEY[/_V*]. Required for
+			// persistent FUSE mounts (encrypts the rclone config blob).
+			if ring, kerr := crypto.NewKeyRingFromEnv(); kerr != nil {
+				log.Fatalf("opensandbox-worker: invalid encryption key config: %v", kerr)
+			} else if ring != nil {
+				store.SetEncryptor(ring.AsEncryptor())
+				log.Printf("opensandbox-worker: secret encryption configured (key version %d)", ring.PrimaryVersion())
+			}
+
 			hibernated, stopped, err := store.ReconcileWorkerSessions(ctx, cfg.WorkerID)
 			if err != nil {
 				log.Printf("opensandbox-worker: warning: session reconciliation failed: %v", err)
@@ -603,7 +614,7 @@ func main() {
 	}
 
 	// HTTP server
-	httpServer := worker.NewHTTPServer(mgr, ptyMgr, execMgr, jwtIssuer, sandboxDBMgr, sbProxy, sbRouter, cfg.SandboxDomain)
+	httpServer := worker.NewHTTPServer(mgr, ptyMgr, execMgr, jwtIssuer, sandboxDBMgr, sbProxy, sbRouter, cfg.SandboxDomain, store)
 	httpAddr := fmt.Sprintf(":%d", cfg.Port)
 	log.Printf("opensandbox-worker: starting HTTP server on %s", httpAddr)
 	go func() {
