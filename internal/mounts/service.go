@@ -121,7 +121,7 @@ func (s *Service) Add(ctx context.Context, sandboxID string, req AddRequest) (Mo
 		readOnly = *req.ReadOnly
 	}
 
-	if err := s.doMount(ctx, sandboxID, req.Path, rcloneConf, readOnly, req.MountOptions); err != nil {
+	if err := s.doMount(ctx, sandboxID, req.Path, req.Remote, rcloneConf, readOnly, req.MountOptions); err != nil {
 		return MountRecord{}, err
 	}
 
@@ -220,7 +220,7 @@ func (s *Service) replayOne(sandboxID string, m db.PersistentMount) {
 		s.markFailed(ctx, sandboxID, m, fmt.Sprintf("decrypt config: %v", err))
 		return
 	}
-	if err := s.doMount(ctx, sandboxID, m.Path, string(plaintext), m.ReadOnly, m.MountOptions); err != nil {
+	if err := s.doMount(ctx, sandboxID, m.Path, m.Remote, string(plaintext), m.ReadOnly, m.MountOptions); err != nil {
 		s.markFailed(ctx, sandboxID, m, err.Error())
 		return
 	}
@@ -255,7 +255,13 @@ func (s *Service) rollbackLiveMount(ctx context.Context, sandboxID, path string)
 
 // doMount is the shared orchestration: probe rclone is present, write the
 // config to tmpfs, mkdir the target, exec `rclone mount --daemon`.
-func (s *Service) doMount(ctx context.Context, sandboxID, target, rcloneConf string, readOnly bool, mountOptions []string) error {
+//
+// `remote` is the full rclone remote spec passed to `rclone mount` (e.g.
+// "s3:my-bucket/prefix"). It is NOT derived from the config section header
+// because rclone needs the `<name>:<path>` form — bare `<name>` makes rclone
+// fall back to its local-filesystem backend at `~/<name>` with no error,
+// which surfaces as a silently-empty mount target.
+func (s *Service) doMount(ctx context.Context, sandboxID, target, remote, rcloneConf string, readOnly bool, mountOptions []string) error {
 	confPath := mountConfPath(target)
 
 	probe, perr := s.manager.Exec(ctx, sandboxID, types.ProcessConfig{
@@ -297,9 +303,8 @@ func (s *Service) doMount(ctx context.Context, sandboxID, target, rcloneConf str
 		return fmt.Errorf("prepare mount target: %w", err)
 	}
 
-	remote := remoteFromConfig(rcloneConf)
 	if remote == "" {
-		return fmt.Errorf("could not derive remote name from rclone config")
+		return fmt.Errorf("internal: empty remote passed to doMount")
 	}
 
 	mountArgs := []string{
