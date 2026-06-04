@@ -37,16 +37,6 @@ export interface AddMountOpts {
   rcloneConfig?: string;
   /** Default `true`. Object-store FUSE mounts have well-known write footguns. */
   readOnly?: boolean;
-  /**
-   * When `true`, the encrypted rclone config is persisted server-side so the
-   * mount is automatically restored on wake (both explicit and idle-wake). If
-   * the post-wake remount fails, the mount appears in `list()` with
-   * `status: "failed"` and an `error` message instead of silently disappearing.
-   *
-   * Defaults to `false` — non-persistent mounts vanish on hibernate and the
-   * server never stores the credentials.
-   */
-  persistent?: boolean;
   /** Extra args appended to `rclone mount` (e.g. `["--dir-cache-time", "1m"]`). */
   mountOptions?: string[];
 }
@@ -56,11 +46,6 @@ export interface MountInfo {
   remote: string;
   backend?: string;
   readOnly: boolean;
-  persistent?: boolean;
-  /** "active" | "replaying" | "failed". Empty/absent for non-persistent mounts. */
-  status?: string;
-  /** Set when `status === "failed"`. */
-  error?: string;
 }
 
 export class Mounts {

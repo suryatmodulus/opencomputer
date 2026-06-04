@@ -614,7 +614,7 @@ func main() {
 	}
 
 	// HTTP server
-	httpServer := worker.NewHTTPServer(mgr, ptyMgr, execMgr, jwtIssuer, sandboxDBMgr, sbProxy, sbRouter, cfg.SandboxDomain, store)
+	httpServer := worker.NewHTTPServer(mgr, ptyMgr, execMgr, jwtIssuer, sandboxDBMgr, sbProxy, sbRouter, cfg.SandboxDomain)
 	httpAddr := fmt.Sprintf(":%d", cfg.Port)
 	log.Printf("opensandbox-worker: starting HTTP server on %s", httpAddr)
 	go func() {

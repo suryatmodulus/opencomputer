@@ -1700,15 +1700,6 @@ func (s *Server) hibernateSandbox(c echo.Context) error {
 		})
 	}
 
-	// FUSE mounts are torn down in the VM by snapshot.go (`fusermount3 -u -a`
-	// before savevm). Drop non-persistent rows from the registry; persistent
-	// rows are kept with status="replaying" so list() reflects the intent
-	// across the hibernate→wake gap, and mounts.Service.OnWake will rebuild
-	// them when the sandbox is woken.
-	if s.mountSvc != nil {
-		s.mountSvc.OnHibernate(id)
-	}
-
 	// Mark hibernated in sandbox router
 	if s.router != nil {
 		timeout := 600 // default for explicit hibernate
@@ -1878,15 +1869,6 @@ func (s *Server) wakeSandbox(c echo.Context) error {
 
 	// Apply pending checkpoint patches in background
 	go s.applyPendingPatches(id, s.workerID)
-
-	// Replay any persistent FUSE mounts. Explicit wake doesn't flow through
-	// router.doWake (which is the auto-wake hook point), so we trigger replay
-	// directly here. Background context so the wake response isn't held up
-	// by remote-storage round-trips; failures show up in mounts.list() with
-	// status="failed" and the error.
-	if s.mountSvc != nil {
-		go s.mountSvc.OnWake(context.Background(), id)
-	}
 
 	// Issue fresh JWT
 	orgID, _ := auth.GetOrgID(c)

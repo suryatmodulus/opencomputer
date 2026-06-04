@@ -214,80 +214,36 @@ await sandbox.mounts.remove("/mnt/data");
 
 ## Hibernate behavior
 
-By default, mounts do **not** survive hibernate. The mount is torn down in the
-VM before the snapshot is taken (otherwise the snapshot would capture broken
-file descriptors that hang processes on wake), and the server doesn't store
-your credentials anywhere — they live only in the VM's tmpfs for the lifetime
-of the mount.
-
-If you want the mount to come back automatically, opt in with `persistent: true`:
-
-<CodeGroup>
-
-```typescript TypeScript
-await sandbox.mounts.add({
-  path: "/mnt/data",
-  remote: "s3:my-bucket",
-  backend: "s3",
-  creds: {...},
-  persistent: true,   // ← opt in
-});
-```
-
-```python Python
-await sandbox.mounts.add(
-    path="/mnt/data",
-    remote="s3:my-bucket",
-    backend="s3",
-    creds={...},
-    persistent=True,
-)
-```
-
-```bash CLI
-oc mounts add sb-abc123 \
-  --path /mnt/data --remote s3:my-bucket --backend s3 \
-  --cred access_key_id=... --cred secret_access_key=... \
-  --persistent
-```
-
-</CodeGroup>
-
-With `persistent: true`:
-
-- The rendered rclone config (which includes your creds) is encrypted with the
-  server's `OPENSANDBOX_SECRET_ENCRYPTION_KEY` and stored in PostgreSQL.
-- On wake — explicit (`sandbox.wake()`) or auto-wake (when any operation hits a
-  hibernated sandbox) — the server replays each persistent mount in the
-  background.
-- Wake completes immediately; mount replay doesn't block it. Inspect
-  `mounts.list()` to see the current state of each mount.
-
-### Wake-time failures
-
-If a persistent mount fails to replay (rotated creds, expired token, network
-issue, deleted bucket, etc.), **the wake still succeeds** — we don't punish
-your whole sandbox for one bad mount. The mount shows up in `list()` with the
-failure surfaced:
+Mounts survive hibernate/wake transparently. The VM snapshot captures the live
+FUSE mount and the rclone daemon process; when the sandbox wakes, both are
+restored as-is. No re-mount call needed — the mount is exactly where you left
+it, with the same credentials, serving the same path.
 
 ```typescript
-const mounts = await sandbox.mounts.list();
-// [
-//   { path: "/mnt/data",  remote: "s3:my-bucket",   status: "active",   persistent: true },
-//   { path: "/mnt/stale", remote: "s3:old-bucket",  status: "failed",   persistent: true,
-//     error: "rclone mount failed (exit 1): AccessDenied: ..." },
-// ]
+await sandbox.mounts.add({ path: "/mnt/data", remote: "s3:my-bucket", backend: "s3", creds });
+
+await sandbox.hibernate();
+await sandbox.wake();
+
+await sandbox.exec.run("ls /mnt/data");   // still works, no re-mount needed
 ```
 
-To recover, either `remove()` the broken mount or `add()` it again with fresh
-creds (re-adding overwrites the prior spec).
+When you want a mount gone, call `remove()` explicitly:
 
-<Note>
-  `persistent: true` requires the server to have `OPENSANDBOX_SECRET_ENCRYPTION_KEY`
-  configured (the same key already used for project secrets). On self-hosted
-  setups without this key, `persistent: true` returns a clear 503 — fall back to
-  non-persistent mounts and remount after wake.
-</Note>
+```typescript
+await sandbox.mounts.remove("/mnt/data");
+```
+
+That triggers an actual `fusermount3 -u` in the VM and drops the registry
+entry. No magic teardown on hibernate.
+
+### Stale credentials
+
+If the credentials behind a mount get rotated or revoked while the sandbox is
+hibernated, the in-VM rclone daemon — restored intact from the snapshot — is
+still holding the *old* keys and will start hitting auth errors on the next
+request. Fix: `mounts.remove(path)` then `mounts.add(...)` again with fresh
+credentials.
 
 ## CLI
 

@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"errors"
 	"net/http"
 
 	"github.com/labstack/echo/v4"
@@ -30,11 +29,7 @@ func (s *Server) addMount(c echo.Context) error {
 		return err
 	}
 	if err := s.routeOrCall(c, id, "mountAdd", routeOp); err != nil {
-		status := http.StatusInternalServerError
-		if errors.Is(err, mounts.ErrPersistenceUnavailable) {
-			status = http.StatusServiceUnavailable
-		}
-		return c.JSON(status, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 	}
 	return c.JSON(http.StatusCreated, rec)
 }

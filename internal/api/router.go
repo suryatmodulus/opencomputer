@@ -143,9 +143,7 @@ func NewServer(mgr sandbox.Manager, ptyMgr *sandbox.PTYManager, apiKey string, o
 	// sandbox manager). In server mode the CP proxies to a worker, which
 	// instantiates its own mounts.Service backed by its own manager.
 	if mgr != nil {
-		// Store is nil until opts is processed below; the persistent-mount
-		// path will return ErrPersistenceUnavailable if it's missing then.
-		s.mountSvc = mounts.NewService(mgr, nil)
+		s.mountSvc = mounts.NewService(mgr)
 	}
 
 	if opts != nil {
@@ -165,21 +163,6 @@ func NewServer(mgr sandbox.Manager, ptyMgr *sandbox.PTYManager, apiKey string, o
 		s.execSessionManager = opts.ExecSessionManager
 		s.sandboxDBs = opts.SandboxDBs
 		s.router = opts.Router
-		// Now that we have the store, upgrade the mount service so persistent
-		// mounts work. The earlier NewService(mgr, nil) was a placeholder for
-		// the no-store case.
-		if mgr != nil && s.store != nil {
-			s.mountSvc = mounts.NewService(mgr, s.store)
-		}
-		// Wire the post-auto-wake hook so persistent FUSE mounts are replayed
-		// when the router auto-wakes a hibernated sandbox on an incoming request.
-		// Explicit-wake API callers (POST /sandboxes/:id/wake) hit a separate
-		// path; that handler triggers replay directly.
-		if s.router != nil && s.mountSvc != nil {
-			s.router.SetOnWake(func(sandboxID string) {
-				s.mountSvc.OnWake(context.Background(), sandboxID)
-			})
-		}
 		s.workerRegistry = opts.WorkerRegistry
 		s.checkpointStore = opts.CheckpointStore
 		s.sandboxDomain = opts.SandboxDomain

@@ -76,20 +76,15 @@ func (m *Manager) doHibernate(ctx context.Context, vm *VMInstance, checkpointSto
 	// failure → kernel panic loop). Bubble the error up so the API caller
 	// gets a clear refusal instead of a silently-corrupted sandbox.
 	if vm.agent != nil {
-		// Tear down any FUSE mounts before savevm so the snapshot doesn't
-		// capture broken file descriptors / hung kernel threads waiting on a
-		// FUSE daemon that won't exist on wake. Best-effort and idempotent:
-		// fusermount3 -u -a is a no-op when there are no FUSE mounts, and the
-		// `|| true` belt-and-braces means a partial failure can't block
-		// hibernate. v1 does not auto-restore mounts on wake; callers re-issue.
-		umountCtx, umountCancel := context.WithTimeout(ctx, 5*time.Second)
-		_, _ = vm.agent.Exec(umountCtx, &pb.ExecRequest{
-			Command:   "/bin/sh",
-			Args:      []string{"-c", "fusermount3 -u -a 2>/dev/null || true"},
-			RunAsRoot: true,
-		})
-		umountCancel()
-
+		// FUSE mounts intentionally are NOT torn down before savevm —
+		// loadvm restores them along with the rest of VM memory (including
+		// the rclone daemons), so mounts naturally survive hibernate/wake.
+		// Two earlier attempts at pre-savevm teardown both wedged the wake
+		// path: `pkill -KILL rclone` captured zombie state that loadvm
+		// couldn't recover; `fusermount3 -u -z` alone left the in-VM agent
+		// unreachable post-loadvm. The "mounts come back on wake" behavior
+		// turned out to be the right product semantics anyway — callers can
+		// explicitly `mounts.remove` when they want a mount gone.
 		if err := quiesceAndCloseAgent(ctx, vm.agent); err != nil {
 			log.Printf("qemu: hibernate %s: refusing savevm — %v", vm.ID, err)
 			return nil, fmt.Errorf("hibernate %s: %w", vm.ID, err)

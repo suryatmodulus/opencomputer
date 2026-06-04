@@ -1,13 +1,11 @@
 package worker
 
 import (
-	"context"
 	"net/http"
 
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	"github.com/opensandbox/opensandbox/internal/auth"
-	"github.com/opensandbox/opensandbox/internal/db"
 	"github.com/opensandbox/opensandbox/internal/mounts"
 	"github.com/opensandbox/opensandbox/internal/observability"
 	"github.com/opensandbox/opensandbox/internal/obslog"
@@ -30,9 +28,7 @@ type HTTPServer struct {
 }
 
 // NewHTTPServer creates a new worker HTTP server for direct SDK access.
-// Pass a non-nil store to enable the mounts API (and persistent mounts in
-// particular — they need PG + encryptor for at-rest cred storage).
-func NewHTTPServer(mgr sandbox.Manager, ptyMgr *sandbox.PTYManager, execMgr *sandbox.ExecSessionManager, jwtIssuer *auth.JWTIssuer, sandboxDBs *sandbox.SandboxDBManager, sbProxy *proxy.SandboxProxy, sbRouter *sandbox.SandboxRouter, sandboxDomain string, store *db.Store) *HTTPServer {
+func NewHTTPServer(mgr sandbox.Manager, ptyMgr *sandbox.PTYManager, execMgr *sandbox.ExecSessionManager, jwtIssuer *auth.JWTIssuer, sandboxDBs *sandbox.SandboxDBManager, sbProxy *proxy.SandboxProxy, sbRouter *sandbox.SandboxRouter, sandboxDomain string) *HTTPServer {
 	e := echo.New()
 	e.HideBanner = true
 	e.HidePort = true
@@ -48,16 +44,7 @@ func NewHTTPServer(mgr sandbox.Manager, ptyMgr *sandbox.PTYManager, execMgr *san
 		sandboxDomain:      sandboxDomain,
 	}
 	if mgr != nil {
-		s.mountSvc = mounts.NewService(mgr, store)
-		// Wire post-auto-wake hook so persistent mounts replay when the worker's
-		// router auto-wakes a sandbox on incoming request. Without this, only
-		// CP-initiated explicit wakes trigger replay; auto-wake-on-request
-		// (the most common flow) would silently lose persistent mounts.
-		if sbRouter != nil {
-			sbRouter.SetOnWake(func(sandboxID string) {
-				s.mountSvc.OnWake(context.Background(), sandboxID)
-			})
-		}
+		s.mountSvc = mounts.NewService(mgr)
 	}
 
 	// Global middleware. Sentry goes first so it can observe panics and

@@ -10,16 +10,13 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// MountInfo mirrors internal/api.MountRecord — copied here to avoid an
+// MountInfo mirrors internal/mounts.MountRecord — copied here to avoid an
 // internal-package import from the CLI binary.
 type MountInfo struct {
-	Path       string `json:"path"`
-	Remote     string `json:"remote"`
-	Backend    string `json:"backend,omitempty"`
-	ReadOnly   bool   `json:"readOnly"`
-	Persistent bool   `json:"persistent,omitempty"`
-	Status     string `json:"status,omitempty"`
-	Error      string `json:"error,omitempty"`
+	Path     string `json:"path"`
+	Remote   string `json:"remote"`
+	Backend  string `json:"backend,omitempty"`
+	ReadOnly bool   `json:"readOnly"`
 }
 
 var mountsCmd = &cobra.Command{
@@ -45,7 +42,6 @@ var mountsAddCmd = &cobra.Command{
 		credsFlag, _ := cmd.Flags().GetStringArray("cred")
 		configFile, _ := cmd.Flags().GetString("config-file")
 		readWrite, _ := cmd.Flags().GetBool("read-write")
-		persistent, _ := cmd.Flags().GetBool("persistent")
 		extraOpts, _ := cmd.Flags().GetStringArray("opt")
 
 		creds := map[string]string{}
@@ -58,10 +54,9 @@ var mountsAddCmd = &cobra.Command{
 		}
 
 		body := map[string]any{
-			"path":       path,
-			"remote":     remote,
-			"readOnly":   !readWrite,
-			"persistent": persistent,
+			"path":     path,
+			"remote":   remote,
+			"readOnly": !readWrite,
 		}
 		if backend != "" {
 			body["backend"] = backend
@@ -90,11 +85,7 @@ var mountsAddCmd = &cobra.Command{
 			if info.ReadOnly {
 				ro = "ro"
 			}
-			persist := ""
-			if info.Persistent {
-				persist = ", persistent"
-			}
-			fmt.Printf("Mounted %s → %s (%s%s)\n", info.Remote, info.Path, ro, persist)
+			fmt.Printf("Mounted %s → %s (%s)\n", info.Remote, info.Path, ro)
 		})
 		return nil
 	},
@@ -117,25 +108,14 @@ var mountsListCmd = &cobra.Command{
 				fmt.Println("No mounts.")
 				return
 			}
-			headers := []string{"PATH", "REMOTE", "BACKEND", "MODE", "PERSIST", "STATUS"}
+			headers := []string{"PATH", "REMOTE", "BACKEND", "MODE"}
 			var rows [][]string
 			for _, m := range mounts {
 				mode := "rw"
 				if m.ReadOnly {
 					mode = "ro"
 				}
-				persist := "no"
-				if m.Persistent {
-					persist = "yes"
-				}
-				status := m.Status
-				if status == "" {
-					status = "active"
-				}
-				if m.Error != "" {
-					status = status + ": " + m.Error
-				}
-				rows = append(rows, []string{m.Path, m.Remote, m.Backend, mode, persist, status})
+				rows = append(rows, []string{m.Path, m.Remote, m.Backend, mode})
 			}
 			printer.Table(headers, rows)
 		})
@@ -167,7 +147,6 @@ func init() {
 	mountsAddCmd.Flags().StringArray("cred", nil, "Backend credential as key=value (repeatable; e.g. --cred access_key_id=AKIA...)")
 	mountsAddCmd.Flags().String("config-file", "", "Path to a raw rclone config file (overrides --backend/--cred)")
 	mountsAddCmd.Flags().Bool("read-write", false, "Mount read-write (default is read-only)")
-	mountsAddCmd.Flags().Bool("persistent", false, "Persist the (encrypted) config server-side so the mount auto-restores on wake")
 	mountsAddCmd.Flags().StringArray("opt", nil, "Extra args appended to `rclone mount` (repeatable)")
 	_ = mountsAddCmd.MarkFlagRequired("path")
 	_ = mountsAddCmd.MarkFlagRequired("remote")

@@ -63,14 +63,6 @@ type RouterConfig struct {
 	DefaultTimeout  time.Duration
 	OnHibernate     func(sandboxID string, result *HibernateResult)
 	OnKill          func(sandboxID string) // called when a sandbox is killed on timeout (hibernate failed or no checkpoint store)
-	// OnWake fires after an auto-wake completes successfully (state transitioned
-	// to StateRunning, rolling timer started). Runs in its own goroutine so a
-	// slow callback can't stall the routed operation that triggered the wake.
-	// Use SetOnWake to attach late if you can't supply it at construction time
-	// (e.g. circular dep between router and API server). Explicit-wake API
-	// callers do NOT flow through doWake, so they must invoke their own
-	// post-wake logic — see api.Server.wakeSandbox.
-	OnWake func(sandboxID string)
 }
 
 // SandboxRouter routes sandbox interactions through a state machine,
@@ -86,7 +78,6 @@ type SandboxRouter struct {
 	defaultTimeout  time.Duration
 	onHibernate     func(sandboxID string, result *HibernateResult)
 	onKill          func(sandboxID string)
-	onWake          func(sandboxID string)
 
 	mu        sync.RWMutex
 	sandboxes map[string]*sandboxEntry
@@ -106,19 +97,8 @@ func NewSandboxRouter(cfg RouterConfig) *SandboxRouter {
 		defaultTimeout:  dt,
 		onHibernate:     cfg.OnHibernate,
 		onKill:          cfg.OnKill,
-		onWake:          cfg.OnWake,
 		sandboxes:       make(map[string]*sandboxEntry),
 	}
-}
-
-// SetOnWake attaches (or replaces) the post-auto-wake callback after
-// construction. Useful when the consumer of the hook (e.g. the API server)
-// can't be passed into RouterConfig because of a construction-order or
-// circular-dependency issue.
-func (r *SandboxRouter) SetOnWake(fn func(sandboxID string)) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.onWake = fn
 }
 
 // Use registers middleware that wraps every routed operation.
@@ -507,17 +487,6 @@ func (r *SandboxRouter) doWake(ctx context.Context, sandboxID string, entry *san
 		})
 	}
 	entry.mu.Unlock()
-
-	// Fire post-wake hook in its own goroutine — a slow user-supplied callback
-	// (e.g. persistent mount replay that talks to S3) must not stall the
-	// routed operation that triggered the auto-wake. Read the field under the
-	// router mutex because SetOnWake can re-bind it.
-	r.mu.RLock()
-	hook := r.onWake
-	r.mu.RUnlock()
-	if hook != nil {
-		go hook(sandboxID)
-	}
 }
 
 // resetTimeout resets the rolling timeout for a sandbox.
