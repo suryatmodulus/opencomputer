@@ -286,31 +286,6 @@ function parsePreviewHost(hostname: string): { sandboxID: string; port: number }
   return { sandboxID: m[1], port };
 }
 
-// generatePreviewToken produces a 32-byte random token, URL-safe base64
-// encoded. The output is ~43 chars, no padding, 256 bits of entropy — more
-// than enough that a SHA-256 of it is fine for the at-rest hash (we don't
-// need PBKDF2/scrypt because there's no low-entropy input to stretch).
-function generatePreviewToken(): string {
-  const bytes = new Uint8Array(32);
-  crypto.getRandomValues(bytes);
-  let bin = "";
-  for (const b of bytes) bin += String.fromCharCode(b);
-  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-// extractPreviewToken pulls the bearer token from one of two accepted
-// headers. Returns null when neither is present or the Authorization header
-// uses a non-Bearer scheme. Tokens-in-querystring are deliberately not
-// supported — they leak into logs and browser history.
-function extractPreviewToken(req: Request): string | null {
-  const x = req.headers.get("X-OC-Preview-Token");
-  if (x) return x.trim();
-  const auth = req.headers.get("Authorization");
-  if (!auth) return null;
-  const m = auth.match(/^Bearer\s+(.+)$/i);
-  return m ? m[1].trim() : null;
-}
-
 // handlePreviewURL is the edge-routed equivalent of the cell-local
 // ControlPlaneProxy.Middleware: resolve the sandbox to its owning cell via
 // D1, then forward the request through that cell's Tunnel to its CP's
@@ -326,39 +301,19 @@ async function handlePreviewURL(
   m: { sandboxID: string; port: number },
 ): Promise<Response> {
   const row = await env.OPENCOMPUTER_DB.prepare(
-    `SELECT s.cell_id, s.status, s.preview_auth_hash, s.preview_auth_scheme, c.base_url
+    `SELECT s.cell_id, s.status, c.base_url
        FROM sandboxes_index s
        JOIN cells c ON s.cell_id = c.cell_id
       WHERE s.id = ?1`,
   )
     .bind(m.sandboxID)
-    .first<{ cell_id: string; status: string; preview_auth_hash: string | null; preview_auth_scheme: string | null; base_url: string }>();
+    .first<{ cell_id: string; status: string; base_url: string }>();
 
   if (!row) return new Response(`sandbox ${m.sandboxID} not found`, { status: 404 });
   if (row.status === "stopped" || row.status === "error") {
     return new Response(`sandbox ${m.sandboxID} is ${row.status}`, { status: 410 });
   }
   // status="hibernated" is fine — CP's doProxy will wake-on-request.
-
-  // Bearer auth gate. When preview_auth_hash is NULL the URL is open (legacy
-  // default). With a hash set, require a matching token in either
-  // `Authorization: Bearer <t>` or `X-OC-Preview-Token: <t>`. We never accept
-  // the token in the query string — that would leak into browser history and
-  // server logs. Check happens before forwarding so a brute-force run hits
-  // the edge worker, not the customer's VM.
-  if (row.preview_auth_hash) {
-    const presented = extractPreviewToken(req);
-    if (!presented) {
-      return new Response("preview URL requires authentication", {
-        status: 401,
-        headers: { "WWW-Authenticate": 'Bearer realm="preview"' },
-      });
-    }
-    const presentedHash = await sha256Hex(presented);
-    if (!constantTimeEqual(presentedHash, row.preview_auth_hash)) {
-      return new Response("invalid preview token", { status: 401 });
-    }
-  }
 
   const url = new URL(req.url);
   const base = row.base_url.replace(/\/$/, "");
@@ -490,41 +445,13 @@ async function createSandbox(req: Request, env: Env): Promise<Response> {
   let bodyCpuCount = 0;
   let bodyMemoryMB = 0;
   let bodyDiskMB = 0;
-  // Preview-URL bearer auth (opt-in). Caller sends `previewAuth: { scheme,
-  // token }`. `token: "auto"` (or omitted) → we generate a random one.
-  // An explicit string lets the caller bring its own (e.g. so its gateway
-  // can mint and share a token with both ends in one round-trip).
-  // The plaintext is returned exactly once in the create response; only
-  // the SHA-256 hex lives in D1.
-  let previewAuthScheme: string | null = null;
-  let previewAuthHash: string | null = null;
-  let previewAuthPlaintext: string | null = null;
   try {
     if (bodyText) {
-      const parsed = JSON.parse(bodyText) as {
-        cellId?: unknown; cpuCount?: unknown; memoryMB?: unknown; diskMB?: unknown;
-        previewAuth?: { scheme?: unknown; token?: unknown };
-      };
+      const parsed = JSON.parse(bodyText) as { cellId?: unknown; cpuCount?: unknown; memoryMB?: unknown; diskMB?: unknown };
       if (typeof parsed.cellId === "string") requestedCellID = parsed.cellId;
       if (typeof parsed.cpuCount === "number") bodyCpuCount = parsed.cpuCount;
       if (typeof parsed.memoryMB === "number") bodyMemoryMB = parsed.memoryMB;
       if (typeof parsed.diskMB === "number") bodyDiskMB = parsed.diskMB;
-      if (parsed.previewAuth && typeof parsed.previewAuth === "object") {
-        const scheme = typeof parsed.previewAuth.scheme === "string" ? parsed.previewAuth.scheme : "bearer";
-        if (scheme !== "bearer") {
-          return json({ error: `previewAuth.scheme must be "bearer" (got ${JSON.stringify(scheme)})` }, 400);
-        }
-        const t = parsed.previewAuth.token;
-        if (t === undefined || t === "auto" || t === null) {
-          previewAuthPlaintext = generatePreviewToken();
-        } else if (typeof t === "string" && t.length >= 16) {
-          previewAuthPlaintext = t;
-        } else {
-          return json({ error: "previewAuth.token must be omitted, \"auto\", or a string of at least 16 characters" }, 400);
-        }
-        previewAuthScheme = "bearer";
-        previewAuthHash = await sha256Hex(previewAuthPlaintext);
-      }
     }
   } catch {
     /* malformed JSON — let the CP reject with a proper 400 */
@@ -596,8 +523,8 @@ async function createSandbox(req: Request, env: Env): Promise<Response> {
     if (parsed.sandboxID) {
       await env.OPENCOMPUTER_DB.prepare(
         `INSERT OR REPLACE INTO sandboxes_index
-           (id, org_id, user_id, cell_id, worker_id, status, cpu_count, memory_mb, created_at, last_event_at, preview_auth_hash, preview_auth_scheme)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11)`,
+           (id, org_id, user_id, cell_id, worker_id, status, cpu_count, memory_mb, created_at, last_event_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)`,
       )
         .bind(
           parsed.sandboxID,
@@ -609,22 +536,8 @@ async function createSandbox(req: Request, env: Env): Promise<Response> {
           bodyCpuCount,
           parsed.memoryMB ?? bodyMemoryMB,
           Math.floor(Date.now() / 1000),
-          previewAuthHash,
-          previewAuthScheme,
         )
         .run();
-    }
-    // Overlay the plaintext preview-auth token onto the CP's response body so
-    // the caller gets `previewAuthToken` alongside `sandboxID` in one round
-    // trip. We do this only on success and only when one was generated/set.
-    // The token is never persisted at the edge in plaintext and never
-    // returned again — rotation issues a new one.
-    if (previewAuthPlaintext) {
-      const merged = { ...parsed, previewAuthToken: previewAuthPlaintext };
-      return new Response(JSON.stringify(merged), {
-        status: cpResp.status,
-        headers: { "content-type": "application/json" },
-      });
     }
   }
   // Pass the CP's response through verbatim (status + body).
@@ -677,29 +590,6 @@ function sandboxRowToJSON(r: SandboxRow): Record<string, unknown> {
     startedAt: isoFromUnix(r.created_at),
     endAt: isoFromUnix(r.stopped_at),
   };
-}
-
-// rotatePreviewAuth issues a new bearer token, swaps the hash on
-// sandboxes_index, and returns the plaintext exactly once. Idempotent in the
-// sense that calling it again produces a fresh token and invalidates the
-// previous one — there is no zero-downtime dual-token mode yet, so the
-// gateway should be able to absorb a brief window of 401s during rollover.
-async function rotatePreviewAuth(req: Request, env: Env, id: string): Promise<Response> {
-  const caller = await authenticate(req, env);
-  if (!caller) return json({ error: "missing or invalid API key" }, 401);
-  const row = await env.OPENCOMPUTER_DB.prepare(
-    "SELECT org_id, status FROM sandboxes_index WHERE id = ?1",
-  ).bind(id).first<{ org_id: string; status: string }>();
-  if (!row || row.org_id !== caller.orgID) return json({ error: "sandbox not found" }, 404);
-  if (row.status === "stopped" || row.status === "error") {
-    return json({ error: `sandbox is ${row.status}` }, 410);
-  }
-  const token = generatePreviewToken();
-  const hash = await sha256Hex(token);
-  await env.OPENCOMPUTER_DB.prepare(
-    "UPDATE sandboxes_index SET preview_auth_hash = ?1, preview_auth_scheme = 'bearer' WHERE id = ?2",
-  ).bind(hash, id).run();
-  return json({ previewAuthToken: token, scheme: "bearer" });
 }
 
 async function listSandboxes(req: Request, env: Env): Promise<Response> {
@@ -1801,11 +1691,6 @@ export default {
           return proxyToCellSDK(req, env, ctx, caller, id);
         }
         return json({ error: "method not allowed" }, 405);
-      }
-      // Preview-URL auth lives purely at the edge — the cell never sees the
-      // hash. Intercept the rotate before the cell-proxy fallback catches it.
-      if (rest === "/preview/rotate" && req.method === "POST") {
-        return rotatePreviewAuth(req, env, id);
       }
       // Anything under /:id/* (exec, files, pty, hibernate, …) lives on the
       // cell — proxy with an edge-minted IdentityToken (the cell's existing

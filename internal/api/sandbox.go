@@ -17,6 +17,7 @@ import (
 	"github.com/opensandbox/opensandbox/internal/db"
 	"github.com/opensandbox/opensandbox/internal/edgeclient"
 	"github.com/opensandbox/opensandbox/internal/observability"
+	"github.com/opensandbox/opensandbox/internal/previewauth"
 	"github.com/opensandbox/opensandbox/pkg/types"
 	pb "github.com/opensandbox/opensandbox/proto/worker"
 )
@@ -245,6 +246,24 @@ func (s *Server) createSandbox(c echo.Context) error {
 			template = "default"
 		}
 		_, _ = s.store.CreateSandboxSession(ctx, sb.ID, orgID, auth.GetUserID(c), template, region, workerID, cfgJSON, metadataJSON, secretStoreID)
+	}
+
+	// Preview-URL auth: same flow as createSandboxRemote — validate the
+	// payload, hash, persist; return plaintext exactly once via sb.PreviewAuthToken.
+	if cfg.PreviewAuth != nil {
+		pt, hash, scheme, vStatus, vErr := previewauth.ProcessRequest(cfg.PreviewAuth.Scheme, cfg.PreviewAuth.Token)
+		if vErr != nil {
+			if vStatus >= 400 && vStatus < 500 {
+				return c.JSON(vStatus, map[string]string{"error": vErr.Error()})
+			}
+			log.Printf("sandbox: %s preview auth setup failed: %v", sb.ID, vErr)
+		} else if hash != "" && s.store != nil {
+			if pErr := s.store.SetSandboxPreviewAuth(ctx, sb.ID, hash, scheme); pErr != nil {
+				log.Printf("sandbox: %s SetSandboxPreviewAuth failed: %v", sb.ID, pErr)
+			} else {
+				sb.PreviewAuthToken = pt
+			}
+		}
 	}
 
 	return c.JSON(http.StatusCreated, sb)
@@ -644,6 +663,27 @@ func (s *Server) createSandboxRemote(c echo.Context, ctx context.Context, cfg ty
 		_ = s.store.UpdateSandboxSessionStatus(ctx, sandboxID, "running", nil)
 	}
 
+	// Preview-URL auth: validate the payload, hash the token, persist it on
+	// the freshly-promoted session row. Done after the running-promotion so
+	// SetSandboxPreviewAuth's row-state check finds the right row. The
+	// plaintext is returned exactly once in the response below.
+	var previewAuthPlaintext string
+	if cfg.PreviewAuth != nil {
+		pt, hash, scheme, vStatus, vErr := previewauth.ProcessRequest(cfg.PreviewAuth.Scheme, cfg.PreviewAuth.Token)
+		if vErr != nil {
+			log.Printf("sandbox: %s preview auth setup failed: %v", grpcResp.SandboxId, vErr)
+			if vStatus >= 400 && vStatus < 500 {
+				return c.JSON(vStatus, map[string]string{"error": vErr.Error()})
+			}
+		} else if hash != "" && s.store != nil {
+			if pErr := s.store.SetSandboxPreviewAuth(ctx, grpcResp.SandboxId, hash, scheme); pErr != nil {
+				log.Printf("sandbox: %s SetSandboxPreviewAuth failed: %v", grpcResp.SandboxId, pErr)
+			} else {
+				previewAuthPlaintext = pt
+			}
+		}
+	}
+
 	// Scale to requested resources after creation (virtio-mem hotplug + cgroup).
 	// Golden snapshot has fixed CPU/RAM — we create with defaults then scale up.
 	if requestedMemoryMB > 0 || requestedCpuCount > 0 {
@@ -697,6 +737,9 @@ func (s *Server) createSandboxRemote(c echo.Context, ctx context.Context, cfg ty
 	}
 	if s.sandboxDomain != "" {
 		resp["sandboxDomain"] = s.sandboxDomain
+	}
+	if previewAuthPlaintext != "" {
+		resp["previewAuthToken"] = previewAuthPlaintext
 	}
 
 	return c.JSON(http.StatusCreated, resp)
@@ -3359,6 +3402,48 @@ func (s *Server) deletePreviewURL(c echo.Context) error {
 	_ = s.store.DeletePreviewURL(ctx, previewURL.ID)
 
 	return c.NoContent(http.StatusNoContent)
+}
+
+// rotateSandboxPreviewAuth mints a fresh preview-URL bearer token, replaces
+// the stored hash, and returns the new plaintext exactly once. The old
+// token stops working immediately — v1 has no dual-token grace period, so
+// callers must be able to tolerate a brief window of 401s during rollover.
+//
+// Org-scoped: callers can only rotate sandboxes they own. Status is
+// checked via SetSandboxPreviewAuth's WHERE clause (running / pending /
+// hibernated only) — rotating a stopped sandbox is a 404 from the store's
+// row-not-found error.
+func (s *Server) rotateSandboxPreviewAuth(c echo.Context) error {
+	sandboxID := c.Param("id")
+	ctx := c.Request().Context()
+
+	if s.store == nil {
+		return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "database not configured"})
+	}
+
+	// Org-scope check: a different org's sandbox should 404, not 200.
+	orgID, hasOrg := auth.GetOrgID(c)
+	if hasOrg {
+		if _, err := s.store.GetSandboxSessionInOrg(ctx, orgID, sandboxID); err != nil {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "sandbox not found"})
+		}
+	}
+
+	token, err := previewauth.GenerateToken()
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+	}
+	if err := s.store.SetSandboxPreviewAuth(ctx, sandboxID, previewauth.SHA256Hex(token), "bearer"); err != nil {
+		// Distinguish "no rows updated" (gone / wrong state) from a real DB error.
+		if strings.Contains(err.Error(), "not found or not in a settable state") {
+			return c.JSON(http.StatusGone, map[string]string{"error": err.Error()})
+		}
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+	}
+	return c.JSON(http.StatusOK, map[string]string{
+		"previewAuthToken": token,
+		"scheme":           "bearer",
+	})
 }
 
 // previewURLToMap converts a PreviewURL to a response map, including customHostname if provided.

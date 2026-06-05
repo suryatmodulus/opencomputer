@@ -16,6 +16,7 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/opensandbox/opensandbox/internal/controlplane"
 	"github.com/opensandbox/opensandbox/internal/db"
+	"github.com/opensandbox/opensandbox/internal/previewauth"
 	pb "github.com/opensandbox/opensandbox/proto/worker"
 )
 
@@ -100,6 +101,28 @@ func (p *ControlPlaneProxy) doProxy(c echo.Context, sandboxID string, port int) 
 		return c.JSON(http.StatusNotFound, map[string]string{
 			"error": fmt.Sprintf("sandbox %s not found", sandboxID),
 		})
+	}
+
+	// Preview-URL bearer auth gate. When session.PreviewAuthHash is NULL the
+	// URL is open (the legacy default). With a hash set, every request must
+	// present a matching token in `Authorization: Bearer X` or
+	// `X-OC-Preview-Token: X`. The check runs before the worker lookup +
+	// wake-on-request so a brute-force run never spins up a hibernated
+	// sandbox or burns wake capacity. Constant-time compare so the hex
+	// digest doesn't leak through timing.
+	if session.PreviewAuthHash != nil && *session.PreviewAuthHash != "" {
+		presented := previewauth.ExtractToken(c.Request())
+		if presented == "" {
+			c.Response().Header().Set("WWW-Authenticate", `Bearer realm="preview"`)
+			return c.JSON(http.StatusUnauthorized, map[string]string{
+				"error": "preview URL requires authentication",
+			})
+		}
+		if !previewauth.ConstantTimeEqualString(previewauth.SHA256Hex(presented), *session.PreviewAuthHash) {
+			return c.JSON(http.StatusUnauthorized, map[string]string{
+				"error": "invalid preview token",
+			})
+		}
 	}
 
 	// If the sandbox is hibernated, wake it on-demand before proxying
