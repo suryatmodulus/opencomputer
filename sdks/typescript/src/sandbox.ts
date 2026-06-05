@@ -41,6 +41,21 @@ export interface SandboxOpts {
   snapshot?: string;
   /** Callback for build log streaming when using `image`. Called with each build step message. */
   onBuildLog?: (log: string) => void;
+  /**
+   * Require a bearer token on the sandbox's preview URLs.
+   *
+   * When set, every request to `https://sb-{id}-p{port}.<domain>` must include
+   * the token in an `Authorization: Bearer <token>` or `X-OC-Preview-Token`
+   * header. The check happens at the edge before traffic reaches the VM —
+   * bad tokens never touch your sandbox.
+   *
+   * Pass `{ token: "auto" }` (or omit `token`) to have the server generate a
+   * 256-bit random token; pass an explicit string (≥16 chars) to bring your
+   * own. The plaintext is returned exactly once on the create response as
+   * `previewAuthToken`. Use `Sandbox.rotatePreviewAuthToken()` to issue a new
+   * one (the old one stops working immediately).
+   */
+  previewAuth?: { scheme?: "bearer"; token?: "auto" | string };
 }
 
 interface SandboxData {
@@ -50,6 +65,9 @@ interface SandboxData {
   connectURL?: string;
   token?: string;
   sandboxDomain?: string;
+  /** Plaintext preview-URL bearer token. Returned exactly once on the create
+   *  or rotate response when `previewAuth` was requested. */
+  previewAuthToken?: string;
 }
 
 export interface CheckpointInfo {
@@ -202,6 +220,19 @@ export class Sandbox {
   private token: string;
   private _status: string;
   private _sandboxDomain: string;
+  /**
+   * Plaintext preview-URL bearer token, available immediately after a
+   * `Sandbox.create({ previewAuth: ... })` call. Read it once and store
+   * it somewhere durable — the server will not return it again. After
+   * a successful `rotatePreviewAuthToken()` this value is replaced
+   * with the new token.
+   *
+   * Empty string when the sandbox was created without `previewAuth`,
+   * or when reconnecting via `Sandbox.connect()` (the server-side hash
+   * is still in effect; only the plaintext is gone). In that case use
+   * `rotatePreviewAuthToken()` to mint a new one.
+   */
+  previewAuthToken: string;
 
   private constructor(data: SandboxData, apiUrl: string, apiKey: string) {
     this.sandboxId = data.sandboxID;
@@ -210,6 +241,7 @@ export class Sandbox {
     this.apiKey = apiKey;
     this.connectUrl = data.connectURL || "";
     this.token = data.token || "";
+    this.previewAuthToken = data.previewAuthToken || "";
     this._sandboxDomain = data.sandboxDomain || "";
 
     // Always route through the CP — it handles readiness waiting and proxies to workers.
@@ -254,6 +286,12 @@ export class Sandbox {
     if (opts.secretStore) body.secretStore = opts.secretStore;
     if (opts.image) body.image = opts.image.toJSON();
     if (opts.snapshot) body.snapshot = opts.snapshot;
+    if (opts.previewAuth) {
+      body.previewAuth = {
+        scheme: opts.previewAuth.scheme ?? "bearer",
+        token: opts.previewAuth.token ?? "auto",
+      };
+    }
 
     // Always use SSE for image/snapshot creation to keep the connection alive
     // through proxies (Cloudflare has a 100s idle timeout).
@@ -302,6 +340,31 @@ export class Sandbox {
 
     const data: SandboxData = await resp.json();
     return new Sandbox(data, apiUrl, apiKey);
+  }
+
+  /**
+   * Issue a new preview-URL bearer token and invalidate the previous one.
+   *
+   * Returns the new plaintext token (also written to `sandbox.previewAuthToken`).
+   * The old token stops working immediately — there is no zero-downtime
+   * dual-token mode in v1, so coordinate the rollover with whoever is calling
+   * your preview URL.
+   *
+   * If the sandbox was created without `previewAuth`, calling this enables the
+   * auth gate from that point on.
+   */
+  async rotatePreviewAuthToken(): Promise<string> {
+    const resp = await fetch(`${this.apiUrl}/sandboxes/${this.sandboxId}/preview/rotate`, {
+      method: "POST",
+      headers: this.apiKey ? { "X-API-Key": this.apiKey } : {},
+    });
+    if (!resp.ok) {
+      const text = await resp.text();
+      throw new Error(`Failed to rotate preview auth token: ${resp.status} ${text}`);
+    }
+    const data = await resp.json() as { previewAuthToken: string };
+    this.previewAuthToken = data.previewAuthToken;
+    return this.previewAuthToken;
   }
 
   async kill(): Promise<void> {

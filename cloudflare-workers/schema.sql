@@ -132,16 +132,18 @@ CREATE TABLE IF NOT EXISTS cells (
 -- Global sandbox index (cross-region routing and listing) -----------------
 
 CREATE TABLE IF NOT EXISTS sandboxes_index (
-  id            TEXT PRIMARY KEY,                 -- sandbox_id
-  org_id        TEXT NOT NULL,
-  user_id       TEXT,
-  cell_id       TEXT NOT NULL,
-  worker_id     TEXT,
-  status        TEXT NOT NULL,                    -- running | hibernated | stopped | error
-  template_id   TEXT,
-  created_at    INTEGER NOT NULL,
-  last_event_at INTEGER,
-  stopped_at    INTEGER
+  id                   TEXT PRIMARY KEY,                 -- sandbox_id
+  org_id               TEXT NOT NULL,
+  user_id              TEXT,
+  cell_id              TEXT NOT NULL,
+  worker_id            TEXT,
+  status               TEXT NOT NULL,                    -- running | hibernated | stopped | error
+  template_id          TEXT,
+  created_at           INTEGER NOT NULL,
+  last_event_at        INTEGER,
+  stopped_at           INTEGER,
+  preview_auth_hash    TEXT,                              -- SHA-256 hex of the bearer token (NULL = open)
+  preview_auth_scheme  TEXT                               -- "bearer" today; reserved for HMAC/JWT later
 );
 CREATE INDEX IF NOT EXISTS idx_sandboxes_org_status ON sandboxes_index(org_id, status);
 CREATE INDEX IF NOT EXISTS idx_sandboxes_cell       ON sandboxes_index(cell_id, status);

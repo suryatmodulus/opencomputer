@@ -35,6 +35,10 @@ type Sandbox struct {
 	ConnectURL string            `json:"connectURL,omitempty"`
 	Token      string            `json:"token,omitempty"`
 	HostPort   int               `json:"hostPort,omitempty"`   // Mapped host port for the sandbox's container port
+	// PreviewAuthToken is the plaintext bearer token for the sandbox's
+	// preview URL, returned exactly once on create when previewAuth was
+	// requested. Empty otherwise. Mirrors the SDK field by the same name.
+	PreviewAuthToken string `json:"previewAuthToken,omitempty"`
 }
 
 // SandboxConfig is the request body for creating a sandbox.
