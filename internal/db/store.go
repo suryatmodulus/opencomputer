@@ -143,6 +143,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 		{43, "migrations/043_credit_halt.up.sql"},
 		{44, "migrations/044_drop_secret_store_fk.up.sql"},
 		{45, "migrations/045_sandbox_mounts.up.sql"},
+		{46, "migrations/046_preview_auth.up.sql"},
 	}
 
 	for _, m := range migrations {
@@ -649,6 +650,44 @@ type SandboxSession struct {
 	MigratingToWorker    string          `json:"migratingToWorker,omitempty"`
 	PatchError           *string         `json:"patchError,omitempty"`
 	GoldenVersion        *string         `json:"goldenVersion,omitempty"`
+	// PreviewAuthHash is the SHA-256 hex of the bearer token required on
+	// preview-URL requests. NULL = open (the default). Plaintext is never
+	// stored — set once via SetSandboxPreviewAuth and rotated via the same.
+	PreviewAuthHash      *string         `json:"-"`
+	PreviewAuthScheme    *string         `json:"-"`
+}
+
+// SetSandboxPreviewAuth installs or rotates the per-sandbox bearer-token gate
+// used by ControlPlaneProxy.doProxy. Passing empty hash + scheme clears the
+// gate (leaves the preview URL open). The hash is plain SHA-256 hex; the
+// scheme column is reserved for future variants (HMAC, JWT) but is "bearer"
+// for everything generated today.
+func (s *Store) SetSandboxPreviewAuth(ctx context.Context, sandboxID, hash, scheme string) error {
+	var hashArg, schemeArg interface{}
+	if hash == "" {
+		hashArg = nil
+	} else {
+		hashArg = hash
+	}
+	if scheme == "" {
+		schemeArg = nil
+	} else {
+		schemeArg = scheme
+	}
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE sandbox_sessions
+		    SET preview_auth_hash = $1, preview_auth_scheme = $2
+		  WHERE sandbox_id = $3
+		    AND status IN ('running', 'pending', 'hibernated')`,
+		hashArg, schemeArg, sandboxID,
+	)
+	if err != nil {
+		return fmt.Errorf("set preview auth: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("sandbox %s not found or not in a settable state", sandboxID)
+	}
+	return nil
 }
 
 func (s *Store) CreateSandboxSession(ctx context.Context, sandboxID string, orgID uuid.UUID, userID *uuid.UUID, template, region, workerID string, config, metadata json.RawMessage, secretStoreID *uuid.UUID) (*SandboxSession, error) {
@@ -875,11 +914,12 @@ func (s *Store) MarkOrphanedSandboxes(ctx context.Context, liveWorkers map[strin
 func (s *Store) GetSandboxSession(ctx context.Context, sandboxID string) (*SandboxSession, error) {
 	session := &SandboxSession{}
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, sandbox_id, org_id, user_id, template, region, worker_id, status, config, metadata, started_at, stopped_at, error_msg, based_on_checkpoint_id, last_patch_sequence, patch_error, golden_version
+		`SELECT id, sandbox_id, org_id, user_id, template, region, worker_id, status, config, metadata, started_at, stopped_at, error_msg, based_on_checkpoint_id, last_patch_sequence, patch_error, golden_version, preview_auth_hash, preview_auth_scheme
 		 FROM sandbox_sessions WHERE sandbox_id = $1 ORDER BY started_at DESC LIMIT 1`, sandboxID,
 	).Scan(&session.ID, &session.SandboxID, &session.OrgID, &session.UserID, &session.Template,
 		&session.Region, &session.WorkerID, &session.Status, &session.Config, &session.Metadata,
-		&session.StartedAt, &session.StoppedAt, &session.ErrorMsg, &session.BasedOnCheckpointID, &session.LastPatchSequence, &session.PatchError, &session.GoldenVersion)
+		&session.StartedAt, &session.StoppedAt, &session.ErrorMsg, &session.BasedOnCheckpointID, &session.LastPatchSequence, &session.PatchError, &session.GoldenVersion,
+		&session.PreviewAuthHash, &session.PreviewAuthScheme)
 	if err != nil {
 		return nil, fmt.Errorf("sandbox session not found: %w", err)
 	}
@@ -895,13 +935,14 @@ func (s *Store) GetSandboxSession(ctx context.Context, sandboxID string) (*Sandb
 func (s *Store) GetSandboxSessionInOrg(ctx context.Context, orgID uuid.UUID, sandboxID string) (*SandboxSession, error) {
 	session := &SandboxSession{}
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, sandbox_id, org_id, user_id, template, region, worker_id, status, config, metadata, started_at, stopped_at, error_msg, based_on_checkpoint_id, last_patch_sequence, patch_error, golden_version
+		`SELECT id, sandbox_id, org_id, user_id, template, region, worker_id, status, config, metadata, started_at, stopped_at, error_msg, based_on_checkpoint_id, last_patch_sequence, patch_error, golden_version, preview_auth_hash, preview_auth_scheme
 		 FROM sandbox_sessions
 		 WHERE org_id = $1 AND sandbox_id = $2
 		 ORDER BY started_at DESC LIMIT 1`, orgID, sandboxID,
 	).Scan(&session.ID, &session.SandboxID, &session.OrgID, &session.UserID, &session.Template,
 		&session.Region, &session.WorkerID, &session.Status, &session.Config, &session.Metadata,
-		&session.StartedAt, &session.StoppedAt, &session.ErrorMsg, &session.BasedOnCheckpointID, &session.LastPatchSequence, &session.PatchError, &session.GoldenVersion)
+		&session.StartedAt, &session.StoppedAt, &session.ErrorMsg, &session.BasedOnCheckpointID, &session.LastPatchSequence, &session.PatchError, &session.GoldenVersion,
+		&session.PreviewAuthHash, &session.PreviewAuthScheme)
 	if err != nil {
 		return nil, fmt.Errorf("sandbox session not found: %w", err)
 	}

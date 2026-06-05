@@ -442,6 +442,7 @@ func NewServer(mgr sandbox.Manager, ptyMgr *sandbox.PTYManager, apiKey string, o
 	api.POST("/sandboxes/:id/preview", s.createPreviewURL)
 	api.GET("/sandboxes/:id/preview", s.listPreviewURLs)
 	api.DELETE("/sandboxes/:id/preview/:port", s.deletePreviewURL)
+	api.POST("/sandboxes/:id/preview/rotate", s.rotateSandboxPreviewAuth)
 
 	// Data-plane routes: in server mode, proxy to workers; otherwise handle locally
 	if s.sandboxAPIProxy != nil {

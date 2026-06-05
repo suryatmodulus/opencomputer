@@ -35,18 +35,36 @@ type Sandbox struct {
 	ConnectURL string            `json:"connectURL,omitempty"`
 	Token      string            `json:"token,omitempty"`
 	HostPort   int               `json:"hostPort,omitempty"`   // Mapped host port for the sandbox's container port
+	// PreviewAuthToken is the plaintext bearer token for the sandbox's
+	// preview URL, returned exactly once on create when previewAuth was
+	// requested. Empty otherwise. Mirrors the SDK field by the same name.
+	PreviewAuthToken string `json:"previewAuthToken,omitempty"`
+}
+
+// SandboxPreviewAuth controls the per-sandbox bearer-token gate that the CP
+// enforces on preview-URL traffic. The plaintext token is returned exactly
+// once in the create response (Sandbox.PreviewAuthToken) and never stored
+// outside the request-handling path; only the SHA-256 hex hash is persisted.
+type SandboxPreviewAuth struct {
+	// Scheme is "bearer" today. Reserved for HMAC/JWT later.
+	Scheme string `json:"scheme,omitempty"`
+	// Token is "auto" (or omitted) to have the server generate a 256-bit
+	// random token, or an explicit string of at least 16 chars to bring
+	// your own. Echoed back as Sandbox.PreviewAuthToken on success.
+	Token  string `json:"token,omitempty"`
 }
 
 // SandboxConfig is the request body for creating a sandbox.
 type SandboxConfig struct {
-	Template   string            `json:"templateID,omitempty"`
-	Alias      string            `json:"alias,omitempty"`
-	Metadata   map[string]string `json:"metadata,omitempty"`
-	Timeout    int               `json:"timeout,omitempty"`    // seconds, default 300
-	CpuCount   int               `json:"cpuCount,omitempty"`   // default 1
-	MemoryMB   int               `json:"memoryMB,omitempty"`   // default 256
-	DiskMB     int               `json:"diskMB,omitempty"`    // workspace disk in MB (default 20480)
-	Envs       map[string]string `json:"envs,omitempty"`
+	Template    string              `json:"templateID,omitempty"`
+	Alias       string              `json:"alias,omitempty"`
+	Metadata    map[string]string   `json:"metadata,omitempty"`
+	Timeout     int                 `json:"timeout,omitempty"`    // seconds, default 300
+	CpuCount    int                 `json:"cpuCount,omitempty"`   // default 1
+	MemoryMB    int                 `json:"memoryMB,omitempty"`   // default 256
+	DiskMB      int                 `json:"diskMB,omitempty"`    // workspace disk in MB (default 20480)
+	Envs        map[string]string   `json:"envs,omitempty"`
+	PreviewAuth *SandboxPreviewAuth `json:"previewAuth,omitempty"`
 	Port       int               `json:"port,omitempty"`       // container port to expose via subdomain (default 80)
 	// NetworkEnabled is a pointer so we can distinguish "unset" from
 	// "explicitly false". Unset defaults to true (see IsNetworkEnabled).

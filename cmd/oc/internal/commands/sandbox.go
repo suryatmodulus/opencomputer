@@ -27,6 +27,8 @@ var sandboxCreateCmd = &cobra.Command{
 		envSlice, _ := cmd.Flags().GetStringSlice("env")
 		metaSlice, _ := cmd.Flags().GetStringSlice("metadata")
 		secretStore, _ := cmd.Flags().GetString("secret-store")
+		previewAuth, _ := cmd.Flags().GetBool("preview-auth")
+		previewAuthToken, _ := cmd.Flags().GetString("preview-auth-token")
 
 		config := types.SandboxConfig{
 			Timeout:  timeout,
@@ -55,6 +57,20 @@ var sandboxCreateCmd = &cobra.Command{
 		if secretStore != "" {
 			body["secretStore"] = secretStore
 		}
+		// --preview-auth-token implies --preview-auth. Either flag attaches the
+		// previewAuth block to the create payload; only the token-having flag
+		// supplies a caller-chosen secret. The plaintext is returned exactly
+		// once via the sandbox response's PreviewAuthToken field; print it
+		// prominently so a piped/scripted caller can capture it.
+		if previewAuth || previewAuthToken != "" {
+			pa := map[string]string{"scheme": "bearer"}
+			if previewAuthToken != "" {
+				pa["token"] = previewAuthToken
+			} else {
+				pa["token"] = "auto"
+			}
+			body["previewAuth"] = pa
+		}
 
 		var sandbox types.Sandbox
 		if err := c.Post(cmd.Context(), "/sandboxes", body, &sandbox); err != nil {
@@ -63,6 +79,9 @@ var sandboxCreateCmd = &cobra.Command{
 
 		printer.Print(sandbox, func() {
 			fmt.Printf("Created sandbox %s (status: %s)\n", sandbox.ID, sandbox.Status)
+			if sandbox.PreviewAuthToken != "" {
+				fmt.Printf("Preview auth token (shown once): %s\n", sandbox.PreviewAuthToken)
+			}
 		})
 		return nil
 	},
@@ -274,6 +293,8 @@ func init() {
 		cmd.Flags().StringSlice("env", nil, "Environment variables (KEY=VALUE)")
 		cmd.Flags().StringSlice("metadata", nil, "Metadata (KEY=VALUE)")
 		cmd.Flags().String("secret-store", "", "Secret store name (injects encrypted secrets)")
+		cmd.Flags().Bool("preview-auth", false, "Require a bearer token on the sandbox's preview URLs (server generates a 256-bit token, printed once)")
+		cmd.Flags().String("preview-auth-token", "", "Bring your own preview-URL bearer token (>=16 chars); implies --preview-auth")
 	}
 
 	// sandbox wake flags

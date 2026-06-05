@@ -113,6 +113,29 @@ var previewDeleteCmd = &cobra.Command{
 	},
 }
 
+// previewRotateAuthCmd issues a fresh bearer token for the sandbox's
+// edge-enforced preview-URL auth gate. The old token stops working
+// immediately — no dual-token grace period in v1.
+var previewRotateAuthCmd = &cobra.Command{
+	Use:   "rotate-auth <sandbox-id>",
+	Short: "Rotate the sandbox's preview-URL bearer token",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		c := client.FromContext(cmd.Context())
+		var resp struct {
+			PreviewAuthToken string `json:"previewAuthToken"`
+			Scheme           string `json:"scheme"`
+		}
+		if err := c.Post(cmd.Context(), fmt.Sprintf("/sandboxes/%s/preview/rotate", args[0]), nil, &resp); err != nil {
+			return err
+		}
+		printer.Print(resp, func() {
+			fmt.Printf("New preview auth token (shown once): %s\n", resp.PreviewAuthToken)
+		})
+		return nil
+	},
+}
+
 func init() {
 	previewCreateCmd.Flags().Int("port", 0, "Container port to expose (required)")
 	previewCreateCmd.Flags().String("domain", "", "Custom domain")
@@ -121,4 +144,5 @@ func init() {
 	previewCmd.AddCommand(previewCreateCmd)
 	previewCmd.AddCommand(previewListCmd)
 	previewCmd.AddCommand(previewDeleteCmd)
+	previewCmd.AddCommand(previewRotateAuthCmd)
 }

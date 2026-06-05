@@ -70,6 +70,12 @@ class Sandbox:
     sandbox_id: str
     status: str = "running"
     template: str = ""
+    #: Plaintext preview-URL bearer token, available immediately after a
+    #: ``Sandbox.create(preview_auth=...)`` call. Read it once and store
+    #: it somewhere durable — the server will not return it again. After
+    #: a successful ``rotate_preview_auth_token()`` this value is replaced
+    #: with the new token. Empty string when not enabled or when reconnecting.
+    preview_auth_token: str = ""
     _api_url: str = ""
     _api_key: str = ""
     _connect_url: str = ""
@@ -94,6 +100,7 @@ class Sandbox:
         image: Image | None = None,
         snapshot: str | None = None,
         on_build_log: Callable[[str], None] | None = None,
+        preview_auth: dict[str, str] | None = None,
     ) -> Sandbox:
         """Create a new sandbox instance.
 
@@ -121,6 +128,15 @@ class Sandbox:
             image: Declarative Image definition. The server builds and caches it as a checkpoint.
             snapshot: Name of a pre-built snapshot to create the sandbox from.
             on_build_log: Callback for build log streaming when using image/snapshot.
+            preview_auth: Require a bearer token on the sandbox's preview URLs.
+                When set, every request to ``https://sb-{id}-p{port}.<domain>``
+                must include the token in an ``Authorization: Bearer <token>``
+                or ``X-OC-Preview-Token`` header. The check happens at the edge
+                before traffic reaches the VM. Pass ``{"token": "auto"}`` (or
+                omit the key) to have the server generate a 256-bit random
+                token; pass an explicit string (>=16 chars) to bring your own.
+                The plaintext is returned exactly once and assigned to
+                ``sandbox.preview_auth_token``.
         """
         url = api_url or os.environ.get("OPENCOMPUTER_API_URL", "https://app.opencomputer.dev")
         url = url.rstrip("/")
@@ -165,6 +181,11 @@ class Sandbox:
             body["image"] = image.to_dict()
         if snapshot is not None:
             body["snapshot"] = snapshot
+        if preview_auth is not None:
+            body["previewAuth"] = {
+                "scheme": preview_auth.get("scheme", "bearer"),
+                "token": preview_auth.get("token", "auto"),
+            }
 
         if use_sse:
             data = await cls._create_with_sse(client, body, on_build_log)
@@ -189,6 +210,7 @@ class Sandbox:
             sandbox_id=data["sandboxID"],
             status=data.get("status", "running"),
             template=template,
+            preview_auth_token=data.get("previewAuthToken", ""),
             _api_url=url,
             _api_key=key,
             _connect_url=connect_url,
@@ -808,6 +830,25 @@ class Sandbox:
         )
         if resp.status_code != 404:
             resp.raise_for_status()
+
+    async def rotate_preview_auth_token(self) -> str:
+        """Issue a new preview-URL bearer token; invalidate the previous one.
+
+        The old token stops working immediately — there is no zero-downtime
+        dual-token mode in v1, so coordinate the rollover with whoever is
+        calling your preview URL. If the sandbox was created without
+        ``preview_auth``, calling this enables the auth gate from now on.
+
+        Returns the new plaintext token (also written to
+        ``self.preview_auth_token``).
+        """
+        resp = await self._client.post(
+            f"/sandboxes/{self.sandbox_id}/preview/rotate",
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        self.preview_auth_token = data["previewAuthToken"]
+        return self.preview_auth_token
 
     async def create_preview_url(self, port: int, domain: str | None = None, auth_config: dict | None = None) -> dict:
         """Create a preview URL targeting a specific container port.
