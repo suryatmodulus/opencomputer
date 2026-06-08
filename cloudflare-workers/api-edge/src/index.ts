@@ -33,6 +33,9 @@ export interface Env extends DashboardEnv {
   // CF_API_TOKEN and CF_ZONE_ID are optional in DashboardEnv (custom domain
   // feature gates on them). Inherited.
   ASSETS?: Fetcher;
+  // Optional alpha Burst Sandbox cell. When unset, burst=true creates
+  // fail closed rather than silently landing on on-demand capacity.
+  BURST_CELL_ID?: string;
 }
 
 // ── small helpers ────────────────────────────────────────────────────────
@@ -440,18 +443,43 @@ async function createSandbox(req: Request, env: Env): Promise<Response> {
 
   // Read body once — used for size-gating, the hard-pin cell peek, and the
   // verbatim forward to the CP.
-  const bodyText = await req.text();
+  let bodyText = await req.text();
   let requestedCellID: string | null = null;
   let bodyCpuCount = 0;
   let bodyMemoryMB = 0;
   let bodyDiskMB = 0;
+  let burst = false;
   try {
     if (bodyText) {
-      const parsed = JSON.parse(bodyText) as { cellId?: unknown; cpuCount?: unknown; memoryMB?: unknown; diskMB?: unknown };
+      const parsed = JSON.parse(bodyText) as {
+        cellId?: unknown;
+        cpuCount?: unknown;
+        memoryMB?: unknown;
+        diskMB?: unknown;
+        burst?: unknown;
+        image?: unknown;
+        snapshot?: unknown;
+      };
       if (typeof parsed.cellId === "string") requestedCellID = parsed.cellId;
       if (typeof parsed.cpuCount === "number") bodyCpuCount = parsed.cpuCount;
       if (typeof parsed.memoryMB === "number") bodyMemoryMB = parsed.memoryMB;
       if (typeof parsed.diskMB === "number") bodyDiskMB = parsed.diskMB;
+      if (typeof parsed.burst === "boolean") burst = parsed.burst;
+
+      if (burst) {
+        if (!env.BURST_CELL_ID) {
+          return json({ error: "Burst Sandboxes alpha is not configured" }, 503);
+        }
+        if (requestedCellID && requestedCellID !== env.BURST_CELL_ID) {
+          return json({ error: "burst cannot be combined with a different cellId" }, 400);
+        }
+        if (parsed.image != null || parsed.snapshot != null) {
+          return json({ error: "Burst Sandboxes do not support image or snapshot creates in alpha" }, 400);
+        }
+        parsed.burst = true;
+        requestedCellID = env.BURST_CELL_ID;
+        bodyText = JSON.stringify(parsed);
+      }
     }
   } catch {
     /* malformed JSON — let the CP reject with a proper 400 */
