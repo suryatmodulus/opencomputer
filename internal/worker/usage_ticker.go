@@ -75,8 +75,16 @@ type UsageTicker struct {
 	interval      time.Duration
 	costPerTickCs int // cents debited per FULL tick interval; scaled by actual interval below
 
-	mu      sync.Mutex
+	mu       sync.Mutex
 	lastSeen map[string]time.Time // sandbox_id → last emit wall-clock
+	// fracRemainder carries the sub-second portion of elapsed time forward
+	// across emits. Without it, `int(elapsed.Seconds())` truncated each tick's
+	// fractional part — ~0.5s lost per tick on average, which compounded into
+	// a ~2.5% systematic under-count on every long-running sandbox (180 ticks
+	// × 0.5s = 90s/hr = 2.5%). With carry-forward, the remainder is bounded
+	// in [0, 1) and any cumulative leftover gets emitted the moment it crosses
+	// a whole second, so long-term drift is zero.
+	fracRemainder map[string]float64
 
 	stop    chan struct{}
 	stopped chan struct{}
@@ -104,6 +112,7 @@ func NewUsageTicker(manager sandbox.Manager, sandboxDBs *sandbox.SandboxDBManage
 		interval:      interval,
 		costPerTickCs: costPerTickCs,
 		lastSeen:      make(map[string]time.Time),
+		fracRemainder: make(map[string]float64),
 		stop:          make(chan struct{}),
 		stopped:       make(chan struct{}),
 	}
@@ -178,10 +187,15 @@ func (t *UsageTicker) tick(ctx context.Context) {
 		}
 		aliveIDs = append(aliveIDs, sb.ID)
 
-		intervalSec := t.intervalSecondsFor(sb, now)
+		intervalSec, newRemainder := t.intervalSecondsFor(sb, now)
 		if intervalSec <= 0 {
-			// Pathological — clock went backwards or two ticks landed in the
-			// same instant. Skip rather than emit a zero/negative debit.
+			// Pathological (clock skew, two ticks in same instant) OR a sub-
+			// second elapsed window that didn't cross a whole-second boundary
+			// yet — in either case, do not emit but DO carry the remainder
+			// forward so we emit the leftover on the next tick when it
+			// crosses ≥1s. Otherwise sub-second jitter at very fast tick
+			// rates would silently drop time.
+			t.markEmitted(sb.ID, now, newRemainder)
 			continue
 		}
 
@@ -206,7 +220,7 @@ func (t *UsageTicker) tick(ctx context.Context) {
 			log.Printf("usage_ticker: %s: LogEvent failed: %v", sb.ID, err)
 			continue
 		}
-		t.markEmitted(sb.ID, now)
+		t.markEmitted(sb.ID, now, newRemainder)
 		emitted++
 	}
 	// Drop state for any sandbox we tracked that didn't appear alive this
@@ -217,14 +231,19 @@ func (t *UsageTicker) tick(ctx context.Context) {
 	log.Printf("usage_ticker: tick: emitted %d usage_tick event(s) for %d listed sandbox(es) (skipped %d as not-alive)", emitted, len(list), skippedDead)
 }
 
-// intervalSecondsFor returns the actual elapsed time (in seconds, integer-rounded)
-// to attribute to this emit. Read-only on the state map.
-func (t *UsageTicker) intervalSecondsFor(sb types.Sandbox, now time.Time) int {
+// intervalSecondsFor returns the actual elapsed time to attribute to this emit
+// as (whole-seconds, leftover-fractional-remainder). The remainder is carried
+// forward to the next tick via markEmitted so that sub-second jitter doesn't
+// accumulate into systematic under-counts. Caller passes the new remainder back
+// to markEmitted; this function is read-only on the state map.
+func (t *UsageTicker) intervalSecondsFor(sb types.Sandbox, now time.Time) (int, float64) {
 	t.mu.Lock()
 	last, seen := t.lastSeen[sb.ID]
+	carried := t.fracRemainder[sb.ID]
 	t.mu.Unlock()
 
 	var elapsed time.Duration
+	capped := false
 	if !seen {
 		// First observation. Measure from sandbox start so a sandbox that
 		// lived briefly between two tick boundaries is attributed its actual
@@ -236,12 +255,16 @@ func (t *UsageTicker) intervalSecondsFor(sb types.Sandbox, now time.Time) int {
 		// retroactively backfilling history that was never measured.
 		if sb.StartedAt.IsZero() {
 			elapsed = t.interval
+			capped = true
 		} else {
 			elapsed = now.Sub(sb.StartedAt)
 			if elapsed > t.interval {
 				elapsed = t.interval
+				capped = true
 			}
 		}
+		// No prior remainder to carry on first observation.
+		carried = 0
 	} else {
 		elapsed = now.Sub(last)
 		// Safety cap at 2× tick interval. Steady state is 1× ± scheduling
@@ -251,12 +274,22 @@ func (t *UsageTicker) intervalSecondsFor(sb types.Sandbox, now time.Time) int {
 		// period of catch-up.
 		if max := 2 * t.interval; elapsed > max {
 			elapsed = max
+			capped = true
 		}
 	}
 	if elapsed < 0 {
-		return 0
+		return 0, 0
 	}
-	return int(elapsed.Seconds())
+	// When we deliberately capped (long gap, unknown StartedAt), the dropped
+	// time is intentional under-billing and should NOT be preserved in the
+	// remainder — otherwise the cap is meaningless.
+	if capped {
+		carried = 0
+	}
+	totalSecs := elapsed.Seconds() + carried
+	emitSecs := int(totalSecs) // floor
+	newRemainder := totalSecs - float64(emitSecs)
+	return emitSecs, newRemainder
 }
 
 // scaledCost returns cents proportional to elapsed time. Steady state at the
@@ -269,15 +302,17 @@ func (t *UsageTicker) scaledCost(intervalSec int) int {
 	return t.costPerTickCs * intervalSec / int(t.interval.Seconds())
 }
 
-func (t *UsageTicker) markEmitted(sandboxID string, when time.Time) {
+func (t *UsageTicker) markEmitted(sandboxID string, when time.Time, remainder float64) {
 	t.mu.Lock()
 	t.lastSeen[sandboxID] = when
+	t.fracRemainder[sandboxID] = remainder
 	t.mu.Unlock()
 }
 
 func (t *UsageTicker) dropState(sandboxID string) {
 	t.mu.Lock()
 	delete(t.lastSeen, sandboxID)
+	delete(t.fracRemainder, sandboxID)
 	t.mu.Unlock()
 }
 
@@ -294,6 +329,7 @@ func (t *UsageTicker) pruneStateNotIn(keep []string) {
 	for id := range t.lastSeen {
 		if _, ok := keepSet[id]; !ok {
 			delete(t.lastSeen, id)
+			delete(t.fracRemainder, id)
 		}
 	}
 }
@@ -345,7 +381,11 @@ func (t *UsageTicker) OnSandboxHibernate(sandboxID string, memoryMB, cpuCount in
 // returns early on missing lastSeen). Setting lastSeen=now gives every
 // subsequent emit a measurable starting point.
 func (t *UsageTicker) OnSandboxWake(sandboxID string) {
-	t.markEmitted(sandboxID, time.Now())
+	// Reset the fractional remainder along with lastSeen. The pre-hibernate
+	// remainder is fully out-of-band relative to post-wake billing — keeping
+	// it would let pre-hibernate sub-second leftovers leak into the first
+	// post-wake emit.
+	t.markEmitted(sandboxID, time.Now(), 0)
 }
 
 // flushSlice emits one usage_tick for the elapsed-since-last-seen interval

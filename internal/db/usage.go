@@ -184,9 +184,19 @@ type OrgUsageSummary struct {
 // short-circuits and the scale event is billed normally — i.e. the default
 // is "bill it", which keeps us safe in all the unknown cases.
 func (s *Store) GetOrgUsage(ctx context.Context, orgID string, from, to time.Time) ([]OrgUsageSummary, error) {
+	// The clip on ended_at is the LEAST of "the row's actual end" (or now() if
+	// still open) and "the window end $3". The previous form
+	//   COALESCE(ended_at, LEAST(now(), $3))
+	// only clipped to $3 when ended_at IS NULL. A scale event with a non-null
+	// ended_at extending past the bucket's end (e.g. a sandbox that scaled at
+	// 17:14 while we're computing the 16:00 bucket) was attributed its FULL
+	// duration (16:42 → 17:14 = 32m) to that prior bucket, even though only
+	// 18m of it fell inside [16:00, 17:00). On long-running sandboxes this
+	// manifested as a phantom "edge under-counts cell" drift on every parity
+	// check that spanned a scale-event boundary.
 	rows, err := s.pool.Query(ctx, `
 		SELECT memory_mb, cpu_percent, disk_mb,
-		       SUM(EXTRACT(EPOCH FROM (COALESCE(ended_at, LEAST(now(), $3)) - GREATEST(started_at, $2)))) as total_seconds
+		       SUM(EXTRACT(EPOCH FROM (LEAST(COALESCE(ended_at, now()), $3) - GREATEST(started_at, $2)))) as total_seconds
 		FROM sandbox_scale_events se
 		WHERE org_id = $1
 		  AND started_at < $3

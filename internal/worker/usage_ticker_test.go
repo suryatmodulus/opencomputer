@@ -17,6 +17,7 @@ func newTestTicker(tickInterval time.Duration, costPerTickCs int) *UsageTicker {
 		interval:      tickInterval,
 		costPerTickCs: costPerTickCs,
 		lastSeen:      make(map[string]time.Time),
+		fracRemainder: make(map[string]float64),
 	}
 }
 
@@ -39,7 +40,7 @@ func TestIntervalSecondsFor_FirstObservation_UsesSandboxStart(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			sb := types.Sandbox{ID: "sb-" + c.name, StartedAt: now.Add(-time.Duration(c.lifeSecs) * time.Second)}
-			got := ticker.intervalSecondsFor(sb, now)
+			got, _ := ticker.intervalSecondsFor(sb, now)
 			if got != c.want {
 				t.Errorf("first-observation interval: got %d, want %d (lifeSecs=%d)", got, c.want, c.lifeSecs)
 			}
@@ -53,7 +54,7 @@ func TestIntervalSecondsFor_FirstObservation_ZeroStartedAtDefaultsToTick(t *test
 	now := time.Now()
 
 	sb := types.Sandbox{ID: "sb-no-start"} // StartedAt zero value
-	got := ticker.intervalSecondsFor(sb, now)
+	got, _ := ticker.intervalSecondsFor(sb, now)
 	if got != 20 {
 		t.Errorf("no StartedAt should default to full tick interval; got %d, want 20", got)
 	}
@@ -67,14 +68,14 @@ func TestIntervalSecondsFor_SubsequentEmits_UseLastSeen(t *testing.T) {
 	sb := types.Sandbox{ID: "sb-1", StartedAt: t0.Add(-5 * time.Second)}
 
 	// First emit at t0: should use StartedAt (5s ago).
-	if got := ticker.intervalSecondsFor(sb, t0); got != 5 {
+	if got, _ := ticker.intervalSecondsFor(sb, t0); got != 5 {
 		t.Fatalf("first emit want 5, got %d", got)
 	}
-	ticker.markEmitted(sb.ID, t0)
+	ticker.markEmitted(sb.ID, t0, 0)
 
 	// Subsequent emit 20s later — should use lastSeen, not StartedAt (25s).
 	t1 := t0.Add(20 * time.Second)
-	if got := ticker.intervalSecondsFor(sb, t1); got != 20 {
+	if got, _ := ticker.intervalSecondsFor(sb, t1); got != 20 {
 		t.Errorf("subsequent emit 20s after last want 20, got %d", got)
 	}
 }
@@ -85,14 +86,127 @@ func TestIntervalSecondsFor_SubsequentEmits_CapsAt2xTickInterval(t *testing.T) {
 	t0 := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
 
 	sb := types.Sandbox{ID: "sb-1", StartedAt: t0.Add(-5 * time.Second)}
-	ticker.markEmitted(sb.ID, t0)
+	ticker.markEmitted(sb.ID, t0, 0)
 
 	// Simulate a big gap (e.g. hibernation we failed to detect): an hour later.
 	// Without the cap we'd attribute 3600 seconds; with the cap, 40.
 	tLate := t0.Add(time.Hour)
-	got := ticker.intervalSecondsFor(sb, tLate)
+	got, _ := ticker.intervalSecondsFor(sb, tLate)
 	if got != 40 {
 		t.Errorf("gap > 2x tick should cap at 40 (= 2×20), got %d", got)
+	}
+}
+
+// TestIntervalSecondsFor_FractionalRemainder_CarriesForwardNoDrift pins the
+// fix for the steady-state ~2.5% under-count.
+//
+// Pre-fix: int(elapsed.Seconds()) truncated each tick's fractional part. If
+// actual elapsed was 19.5s every tick, each one billed 19s and silently lost
+// 0.5s. Over 180 ticks/hour = 90s/hour lost = 2.5% systematic under-bill.
+//
+// Post-fix: the fractional leftover is stashed in fracRemainder and added to
+// the next tick's elapsed. After enough ticks the cumulative leftover crosses
+// a whole-second boundary and gets billed as a 20s tick instead of the usual
+// 19s. Long-term drift goes to zero; the carried value stays bounded in [0, 1).
+func TestIntervalSecondsFor_FractionalRemainder_CarriesForwardNoDrift(t *testing.T) {
+	tick := 20 * time.Second
+	ticker := newTestTicker(tick, 10)
+	t0 := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	sb := types.Sandbox{ID: "sb-steady", StartedAt: t0}
+	ticker.markEmitted(sb.ID, t0, 0)
+
+	// Simulate 200 ticks with 19.5s elapsed each (the average inter-tick gap
+	// we observed in prod). Real total elapsed: 200 × 19.5 = 3900s. Pre-fix
+	// would bill 200 × 19 = 3800s (100s lost). Post-fix should bill 3900s ±
+	// at most one second (the in-flight remainder at the end of the run).
+	totalBilled := 0
+	now := t0
+	for i := 0; i < 200; i++ {
+		now = now.Add(19500 * time.Millisecond) // 19.5s
+		emit, rem := ticker.intervalSecondsFor(sb, now)
+		totalBilled += emit
+		ticker.markEmitted(sb.ID, now, rem)
+		if rem < 0 || rem >= 1 {
+			t.Fatalf("remainder must stay in [0,1); got %g at tick %d", rem, i)
+		}
+	}
+	// Allow ±1s for the leftover that hasn't crossed a boundary yet.
+	wantApprox := 19 * 200 // would be 19 per tick on the old code → 3800
+	wantExact := 3900      // 200 × 19.5
+	if totalBilled <= wantApprox {
+		t.Fatalf("carry-forward not working: billed %ds <= pre-fix-truncation %ds", totalBilled, wantApprox)
+	}
+	if diff := wantExact - totalBilled; diff < 0 || diff > 1 {
+		t.Fatalf("steady-state drift: billed %ds, want within 1s of %ds (off by %ds)", totalBilled, wantExact, diff)
+	}
+}
+
+// TestIntervalSecondsFor_FractionalRemainder_SubSecondTicksAccumulate pins the
+// "tick fires multiple times per second" edge case. Each individual elapsed
+// is < 1s so emit=0, but the remainder must carry so the eventual cumulative
+// crossing of 1s gets emitted. Without this, very fast ticking would drop all
+// time silently.
+func TestIntervalSecondsFor_FractionalRemainder_SubSecondTicksAccumulate(t *testing.T) {
+	tick := 20 * time.Second
+	ticker := newTestTicker(tick, 10)
+	t0 := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	sb := types.Sandbox{ID: "sb-fast", StartedAt: t0}
+	ticker.markEmitted(sb.ID, t0, 0)
+
+	// Three sub-second ticks: 0.4s, 0.4s, 0.4s → total 1.2s elapsed.
+	// First two emit 0 but carry 0.4 and 0.8; third crosses 1s, emits 1, carries 0.2.
+	cases := []struct {
+		advanceMs       int
+		wantEmit        int
+		wantRemainAbout float64
+	}{
+		{400, 0, 0.4},
+		{400, 0, 0.8},
+		{400, 1, 0.2},
+	}
+	now := t0
+	totalEmit := 0
+	for i, c := range cases {
+		now = now.Add(time.Duration(c.advanceMs) * time.Millisecond)
+		emit, rem := ticker.intervalSecondsFor(sb, now)
+		totalEmit += emit
+		if emit != c.wantEmit {
+			t.Errorf("step %d: emit=%d, want %d", i, emit, c.wantEmit)
+		}
+		if abs := rem - c.wantRemainAbout; abs > 0.001 || abs < -0.001 {
+			t.Errorf("step %d: remainder=%g, want ~%g", i, rem, c.wantRemainAbout)
+		}
+		ticker.markEmitted(sb.ID, now, rem)
+	}
+	if totalEmit != 1 {
+		t.Errorf("three 0.4s ticks should emit 1s total (cumulative >= 1.0); got %d", totalEmit)
+	}
+}
+
+// TestIntervalSecondsFor_FractionalRemainder_CapDiscardsRemainder pins that
+// when intervalSecondsFor caps the elapsed (e.g. a 2× tick-interval gap from
+// a missed wake-detection), the carried remainder is also dropped. Otherwise
+// the cap is meaningless — a prior fractional carry would let us bill back
+// the very seconds we deliberately chose to drop.
+func TestIntervalSecondsFor_FractionalRemainder_CapDiscardsRemainder(t *testing.T) {
+	tick := 20 * time.Second
+	ticker := newTestTicker(tick, 10)
+	t0 := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	sb := types.Sandbox{ID: "sb-1", StartedAt: t0}
+
+	// Seed a sizable carried remainder (0.99s) and an old lastSeen.
+	ticker.markEmitted(sb.ID, t0, 0.99)
+	// Now jump an hour into the future — that's >> 2× interval, so the cap
+	// kicks in (elapsed clamps to 40s = 2×20s).
+	tLate := t0.Add(time.Hour)
+	emit, rem := ticker.intervalSecondsFor(sb, tLate)
+	if emit != 40 {
+		t.Errorf("capped emit want 40 (2×interval); got %d", emit)
+	}
+	// With cap engaged, the carried 0.99 is discarded — new remainder should
+	// be the fractional part of 40.0 (= 0), NOT 40.99 → 40 emit + 0.99 carry.
+	if rem != 0 {
+		t.Errorf("capped tick must zero the carried remainder; got %g", rem)
 	}
 }
 
@@ -102,10 +216,10 @@ func TestIntervalSecondsFor_ClockBackwardReturnsZero(t *testing.T) {
 	t0 := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
 
 	sb := types.Sandbox{ID: "sb-1", StartedAt: t0}
-	ticker.markEmitted(sb.ID, t0)
+	ticker.markEmitted(sb.ID, t0, 0)
 
 	earlier := t0.Add(-5 * time.Second)
-	if got := ticker.intervalSecondsFor(sb, earlier); got != 0 {
+	if got, _ := ticker.intervalSecondsFor(sb, earlier); got != 0 {
 		t.Errorf("clock going backwards should yield 0, got %d", got)
 	}
 }
@@ -147,8 +261,8 @@ func TestStateLifecycle_MarkAndDrop(t *testing.T) {
 	ticker := newTestTicker(20*time.Second, 10)
 	t0 := time.Now()
 
-	ticker.markEmitted("sb-1", t0)
-	ticker.markEmitted("sb-2", t0)
+	ticker.markEmitted("sb-1", t0, 0)
+	ticker.markEmitted("sb-2", t0, 0)
 
 	// Both tracked
 	if len(ticker.lastSeen) != 2 {
@@ -168,9 +282,9 @@ func TestStateLifecycle_MarkAndDrop(t *testing.T) {
 func TestPruneStateNotIn(t *testing.T) {
 	ticker := newTestTicker(20*time.Second, 10)
 	t0 := time.Now()
-	ticker.markEmitted("sb-a", t0)
-	ticker.markEmitted("sb-b", t0)
-	ticker.markEmitted("sb-c", t0)
+	ticker.markEmitted("sb-a", t0, 0)
+	ticker.markEmitted("sb-b", t0, 0)
+	ticker.markEmitted("sb-c", t0, 0)
 
 	// Only sb-a and sb-c are alive this tick.
 	ticker.pruneStateNotIn([]string{"sb-a", "sb-c"})
@@ -224,7 +338,7 @@ func TestOnSandboxScale_TrueNoOpWhenNoStartedAtAndUnseen(t *testing.T) {
 func TestOnSandboxScale_ResetsLastSeen(t *testing.T) {
 	ticker := newTestTicker(20*time.Second, 10)
 	t0 := time.Now().Add(-30 * time.Second)
-	ticker.markEmitted("sb-1", t0)
+	ticker.markEmitted("sb-1", t0, 0)
 
 	// flushSlice without sandboxDBs will hit the LogEvent path and fail; we
 	// guard against the nil deref by skipping the LogEvent test. Just check
@@ -247,8 +361,8 @@ func TestOnSandboxScale_ResetsLastSeen(t *testing.T) {
 func TestOnSandboxDestroy_DropsState(t *testing.T) {
 	ticker := newTestTicker(20*time.Second, 10)
 	t0 := time.Now().Add(-15 * time.Second)
-	ticker.markEmitted("sb-1", t0)
-	ticker.markEmitted("sb-2", t0)
+	ticker.markEmitted("sb-1", t0, 0)
+	ticker.markEmitted("sb-2", t0, 0)
 
 	// With nil sandboxDBs, flushSlice will skip the LogEvent but still drop
 	// state (state mutation happens before the Get/Log call).
@@ -296,7 +410,7 @@ func TestRegression_DestroyWithoutPriorTick_UsesStartedAt(t *testing.T) {
 func TestOnSandboxHibernate_DropsState(t *testing.T) {
 	ticker := newTestTicker(20*time.Second, 10)
 	t0 := time.Now().Add(-15 * time.Second)
-	ticker.markEmitted("sb-1", t0)
+	ticker.markEmitted("sb-1", t0, 0)
 	ticker.sandboxDBs = nil
 
 	defer func() {
@@ -313,7 +427,7 @@ func TestOnSandboxHibernate_DropsState(t *testing.T) {
 func TestOnSandboxWake_SetsLastSeenToNow(t *testing.T) {
 	ticker := newTestTicker(20*time.Second, 10)
 	t0 := time.Now().Add(-1 * time.Hour) // simulate pre-hibernate state from long ago
-	ticker.markEmitted("sb-1", t0)
+	ticker.markEmitted("sb-1", t0, 0)
 
 	before := time.Now()
 	ticker.OnSandboxWake("sb-1")
@@ -378,7 +492,7 @@ func TestRegression_ShortSandboxNoLongerOverbilled(t *testing.T) {
 	// Sandbox that lived 4 seconds — what sid's workload looks like.
 	sb := types.Sandbox{ID: "sb-bursty", StartedAt: now.Add(-4 * time.Second), MemoryMB: 4096}
 
-	interval := ticker.intervalSecondsFor(sb, now)
+	interval, _ := ticker.intervalSecondsFor(sb, now)
 	cost := ticker.scaledCost(interval)
 
 	// 4s elapsed, attributed as 4s — not 20s as in the broken version.
@@ -391,9 +505,9 @@ func TestRegression_ShortSandboxNoLongerOverbilled(t *testing.T) {
 	}
 
 	// Sanity: a 1-hour-long-lived sandbox at steady-state still bills 10c per tick.
-	ticker.markEmitted("sb-long", now.Add(-20*time.Second))
+	ticker.markEmitted("sb-long", now.Add(-20*time.Second), 0)
 	sbLong := types.Sandbox{ID: "sb-long", StartedAt: now.Add(-time.Hour), MemoryMB: 4096}
-	if got := ticker.intervalSecondsFor(sbLong, now); got != 20 {
+	if got, _ := ticker.intervalSecondsFor(sbLong, now); got != 20 {
 		t.Errorf("steady-state tick want 20s, got %d", got)
 	}
 	if got := ticker.scaledCost(20); got != 10 {

@@ -286,6 +286,23 @@ func (s *Store) UpsertUserFromCapToken(ctx context.Context, userID, orgID uuid.U
 // before sandbox create — when the edge has authoritatively decided this org
 // is valid, but the cell PG may not have seen it yet (no backfill).
 //
+// GetOrgPlan returns the plan string for an org without hydrating the full
+// row. Used by the usage-parity checker (and any other caller that just
+// needs to gate on pro vs free) to avoid an unnecessary GetOrg roundtrip.
+// Empty string + nil error when the org row doesn't exist — caller decides
+// whether that's a hard failure or a "skip silently" condition.
+func (s *Store) GetOrgPlan(ctx context.Context, orgID string) (string, error) {
+	var plan string
+	err := s.pool.QueryRow(ctx, `SELECT plan FROM orgs WHERE id = $1`, orgID).Scan(&plan)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", nil
+		}
+		return "", fmt.Errorf("get org plan: %w", err)
+	}
+	return plan, nil
+}
+
 // Plan from the cap-token wins on insert; on conflict we update plan so a
 // pro-upgrade reflected at the edge propagates to the cell on the next
 // sandbox-create round-trip without a separate sync job.

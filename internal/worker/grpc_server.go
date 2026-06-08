@@ -781,11 +781,24 @@ func (s *GRPCServer) WakeSandbox(ctx context.Context, req *pb.WakeSandboxRequest
 		}
 	}
 
-	// Resume billing scale event after wake. Disk size is preserved across wake —
-	// pass 0 so RecordScaleEvent inherits disk_mb from the prior event.
+	// Resume billing scale event after wake. The post-wake config is whatever
+	// the manager just restored (virtio-mem plugs the snapshot back to its
+	// pre-hibernate total, so sb.MemoryMB reflects the actual running tier).
+	// Pre-fix this was hardcoded to 1024 MB / 100% CPU with a TODO, so every
+	// woken sandbox got billed at the smallest tier in cell PG regardless of
+	// the actual memory the worker just plugged in — direct cause of the
+	// "cell under-counts wake" drift the parity checker was reporting.
+	// Disk size is preserved across wake; pass 0 so RecordScaleEvent inherits
+	// disk_mb from the prior event.
 	if s.store != nil {
-		memMB := 1024 // TODO: get actual memory from sandbox state
-		cpuPct := 100
+		memMB := sb.MemoryMB
+		if memMB <= 0 {
+			memMB = 1024
+		}
+		cpuPct := (memMB * 100) / 1024
+		if cpuPct < 100 {
+			cpuPct = 100
+		}
 		orgID, _ := s.store.GetSandboxOrgID(ctx, sb.ID)
 		if orgID != "" {
 			if err := s.store.RecordScaleEvent(ctx, sb.ID, orgID, memMB, cpuPct, 0); err != nil {

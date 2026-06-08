@@ -57,6 +57,11 @@ type UsageParityChecker struct {
 type usageParitySource interface {
 	GetOrgUsage(ctx context.Context, orgID string, from, to time.Time) ([]db.OrgUsageSummary, error)
 	ListOrgIDsWithScaleEvents(ctx context.Context, from, to time.Time) ([]string, error)
+	// GetOrgPlan is used to skip free orgs, whose edge-side accounting lives
+	// in the CreditAccount DO (per-event /debit fan-out) rather than in the
+	// edge's usage_samples table. Comparing a free org's cell GB-seconds to
+	// usage_samples is a category mismatch — it will always report -100%.
+	GetOrgPlan(ctx context.Context, orgID string) (string, error)
 }
 
 // UsageParityConfig configures the checker. ParityURL empty => disabled.
@@ -172,10 +177,22 @@ func (c *UsageParityChecker) tick(ctx context.Context) error {
 		union[id] = struct{}{}
 	}
 
-	checked, flagged := 0, 0
+	checked, flagged, skippedFree := 0, 0, 0
 	var worstPct float64
 	var worstOrg string
 	for org := range union {
+		// Free orgs are accounted for at the edge by the CreditAccount DO
+		// (events-ingest fans out /debit per usage_tick), not by writes to
+		// usage_samples. Comparing their cell GB·s against an empty
+		// usage_samples slice is a category mismatch — would always emit
+		// -100% drift and drown out real signal.
+		plan, planErr := c.store.GetOrgPlan(ctx, org)
+		if planErr != nil {
+			log.Printf("usage_parity: org=%s plan lookup failed: %v — including in check anyway", org, planErr)
+		} else if plan != "pro" {
+			skippedFree++
+			continue
+		}
 		cellGB, err := c.cellGBSeconds(ctx, org, from, to)
 		if err != nil {
 			log.Printf("usage_parity: org=%s cell usage: %v", org, err)
@@ -196,8 +213,8 @@ func (c *UsageParityChecker) tick(ctx context.Context) error {
 		}
 	}
 
-	log.Printf("usage_parity: bucket=%s checked=%d flagged=%d (tolerance=%.1f%%) worst=%s (%+.1f%%)",
-		from.Format(time.RFC3339), checked, flagged, c.tolerance*100, worstOrg, worstPct*100)
+	log.Printf("usage_parity: bucket=%s checked=%d flagged=%d skipped_free=%d (tolerance=%.1f%%) worst=%s (%+.1f%%)",
+		from.Format(time.RFC3339), checked, flagged, skippedFree, c.tolerance*100, worstOrg, worstPct*100)
 	return nil
 }
 
